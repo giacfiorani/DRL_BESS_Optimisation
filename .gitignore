@@ -1,0 +1,16 @@
+# macOS & editors
+.DS_Store
+.vscode/
+.idea/
+
+# Python
+__pycache__/
+.ipynb_checkpoints/
+*.pyc
+
+# Virtual env
+.venv/
+# Data & results (keep raw small CSVs if you want, but ignore heavy stuff)
+data/processed/
+results/runs/
+results/trained_models/
