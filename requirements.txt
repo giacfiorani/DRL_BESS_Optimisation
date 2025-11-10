@@ -1,0 +1,12 @@
+# Core
+numpy>=1.26
+pandas>=2.2
+pyarrow>=16.0  # Parquet
+requests>=2.32
+tqdm>=4.66
+
+# RL stack
+gymnasium[classic-control]>=0.29
+torch>=2.3
+stable-baselines3>=2.3.2
+matplotlib>=3.8
