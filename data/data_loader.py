@@ -103,7 +103,7 @@ def fetch_system_prices_range(start_date: str, end_date: str, sleep_s: float = 0
 
 # ----- Carbon Intensity Data -----
 
-URL = "https://api.neso.energy/api/3/action/datastore_search"
+URL = "https://api.neso.energy/api/3/action/datastore_search_sql"
 RESOURCE_ID = "f93d1835-75bc-43e5-84ad-12472b180a98"  # Carbon intensity dataset ID
 
 
@@ -114,11 +114,11 @@ def fetch_carbon_sql(start_date: str, end_date: str) -> pd.DataFrame:
     Dates are ISO strings: 'YYYY-MM-DD'.
     """
     sql = f"""
-    SELECT *
-    FROM "{RESOURCE_ID}"
-    WHERE "from" >= '{start_date}T00:00:00'
-      AND "from" <  '{end_date}T00:00:00'
-    ORDER BY "from" ASC
+        SELECT *
+        FROM "{RESOURCE_ID}"
+        WHERE "DATETIME" >= '{start_date}T00:00:00+00:00'
+        AND "DATETIME" <  '{end_date}T00:00:00+00:00'
+        ORDER BY "DATETIME" ASC
     """
     r = requests.get(URL, params={"sql": sql}, timeout=60)
     r.raise_for_status()
