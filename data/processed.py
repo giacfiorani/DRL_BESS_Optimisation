@@ -8,11 +8,11 @@ end   = "2024-03-01"
 
 prices_df = fetch_system_prices_range(start, end)
 carbon_df = fetch_carbon_sql(start, end)
-
-print(prices_df.head())
-print(carbon_df.head())
-print(prices_df["timestamp"].min(), prices_df["timestamp"].max())
-print(carbon_df["timestamp"].min(), carbon_df["timestamp"].max())
+ 
+# print(prices_df.head())
+# print(carbon_df.head())
+# print(prices_df["timestamp"].min(), prices_df["timestamp"].max())
+# print(carbon_df["timestamp"].min(), carbon_df["timestamp"].max())
 
 #Cleaning the timestamp column 
 def  clean_ts(df):
