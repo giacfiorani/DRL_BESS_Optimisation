@@ -1,231 +1,228 @@
-import sys
-
 import gymnasium as gym
 import pandas as pd
-from gymnasium import Env, spaces
-from pandas._config import detect_console_encoding
-from pandas._libs.tslibs import delta_to_nanoseconds
-from pandas.io import parquet
-import config
 import numpy as np
-import matplotlib.pyplot as plt
-
+from gymnasium import Env, spaces
+import config
 
 
 class BatteryEnv(Env):
     def __init__(self, config):
+        super().__init__()
 
         # ========
-        # LOAD CONFIG PARAMETERS
+        # 1. HARDWARE & MDP PARAMETERS
         # ========
+        # CATL EnerOne 1P416S
+        self.N_cells = config.N_cells
+        self.Q_cell_Ah = config.Q_cell
+        # Pack charge (Coulombs): 280 Ah * 3600 s/h
+        self.Q_pack_C = config.Q_cell_C  # 1,008,000 C
+        self.V_nominal = config.V_nominal  # V
 
-        self.power_max = config.P_max
-        self.energy_max = config.E_max
+        # Operational limits (from your MDP)
         self.SoC_min = config.SoC_min
         self.SoC_max = config.SoC_max
-        self.eff_dis = config.eff_dis
-        self.eff_ch = config.eff_ch
-        self.time_step = config.dt
-        self.SoC_initial = config.SoC_initial
-        self.self_discharge = config.self_dis
-        C_rate= config.C_rate
-        self.P_step = C_rate * self.energy_max
-        self.lambda_ci = config.lambda_ci  # Store as instance variable for use in step()
+        self.SoC_initial = float(config.SoC_initial)
 
-        # ========
-        # LOAD DATA
-        # ========
-        #Load the data that was processed in data folder
-        merged_data = pd.read_parquet("data/merged_data.parquet")   
+        # Time step: 30 minutes
+        self.dt_hours = config.dt
+        self.dt_seconds = self.dt_hours * 3600.0
 
-        #Price dataset
-        self.sell_price_data = merged_data['ssp'].to_numpy(dtype=np.float32)
-        self.buy_price_data = merged_data['sbp'].to_numpy(dtype=np.float32)
-        #Carbon Intensity dataset
-        self.carbon_intensity_data = merged_data['carbon_gco2_kwh'].to_numpy(dtype=np.float32)
+        # Efficiencies (from your MDP)
+        self.eta_ch = config.eff_ch   # charge efficiency
+        self.eta_dis = config.eff_dis    # discharge efficiency
+
+        # Power / action scaling
+        # P_step ≈ 0.5C * E_nominal ≈ 0.186 MW (can be refined)
+        self.P_step_MW = config.P_step
+
+        # Reward config: carbon weight λ
+        self.lambda_ci = float(config.lambda_ci)
         
-        #Timestamp data - convert to useful feature tau_t (0-47)
-        self.timestamp = pd.to_datetime(merged_data['timestamp'])
-        self.tau_data = (self.timestamp.dt.hour * 2 + (self.timestamp.dt.minute // 30)).to_numpy()
+        # ECM R-int model parameter (internal resistance)
+        R_cell_mOhm = 0.35  # mΩ per cell (typical for 280Ah LFP)
+        self.R_sys = (R_cell_mOhm / 1000.0) * self.N_cells  # Ω (pack resistance)
+
+        # ========
+        # 2. OCV LOOKUP TABLE (HARDCODED, FROM YOUR DATA)
+        # ========
+        self.ocv_soc_points = np.array(
+            [0.00, 0.05, 0.10, 0.15, 0.20,
+             0.30, 0.40, 0.50, 0.60, 0.70,
+             0.80, 0.90, 0.95, 1.00],
+            dtype=np.float32,
+        )
+        self.ocv_cell_volts = np.array(
+            [2.874, 3.193, 3.225, 3.252, 3.278,
+             3.304, 3.306, 3.309, 3.317, 3.342,
+             3.342, 3.342, 3.341, 3.352],
+            dtype=np.float32,
+        )
+
+        # ========
+        # 3. LOAD DATA
+        # ========
+        merged_data = pd.read_parquet("data/merged_data.parquet")
+
+        # Price datasets (£/MWh)
+        self.ssp_data = merged_data["ssp"].to_numpy(dtype=np.float32)  # Settlement Sell Price
+        self.sbp_data = merged_data["sbp"].to_numpy(dtype=np.float32)  # Settlement Buy Price
         
-        # ========
-        # INTERNAL ENV VARIABLES
-        # ========
+        # Carbon intensity dataset (gCO2/kWh)
+        self.ci_data = merged_data["carbon_gco2_kwh"].to_numpy(dtype=np.float32)
         
-        self.current_timestep = 0
-        self.SoC = self.SoC_initial
-        self.reward = 0
-        self.actions = []
+        # Time encoding τ_t = hour * 2 + minute // 30
+        self.timestamp = pd.to_datetime(merged_data["timestamp"])
+        self.tau_data = (
+            self.timestamp.dt.hour * 2
+            + (self.timestamp.dt.minute // 30)
+        ).to_numpy(dtype=np.int32)
+
+        self.max_steps = len(self.ssp_data)
 
         # ========
-        # ACTION SPACE (DISCRETE)
+        # 4. INTERNAL ENV VARIABLES
         # ========
-        # -1 (charge), 0 (idle), +1 (discharge)
-        # Agent sees 0/1/2 and we map internally
-        self.action_space = gym.spaces.Discrete(3)
+        self.current_step = 0
+        self.soc = self.SoC_initial
+        self.p_prev = 0.0
+        self.reward = 0.0
+        self.actions = []  
 
         # ========
-        # OBSERVATION SPACE 
+        # 5. ACTION SPACE (DISCRETE)
         # ========
-        # State = [SoC, price, carbon intensity, tau]
-        #these values can be changed accordingly but are high and low values for the agent to understand what the range is
-        low  = np.array([0.0,    -300,   0.0,   0    ], dtype=np.float32)
-        high = np.array([1.0,  500, 1000.0, 48    ], dtype=np.float32)
+        self.action_space = gym.spaces.Discrete(3)  # {0,1,2} → {-1,0,+1}
 
+        # ========
+        # 6. OBSERVATION SPACE
+        # ========
+        # [SoC_t, price_t, CI_t, τ_t, P_{t-1}]
+        low = np.array(
+            [0.0, -300.0, 0.0, 0.0, -self.P_step_MW],
+            dtype=np.float32,
+        )
+        high = np.array(
+            [1.0, 500.0, 1000.0, 49.0, self.P_step_MW],
+            dtype=np.float32,
+        )
         self.observation_space = gym.spaces.Box(low=low, high=high, dtype=np.float32)
 
-        # ========
-        # INITIAL STATE 
-        # ========
-        
-        self.state = np.array([
-            self.SoC,
-            self.sell_price_data[0],
-            self.carbon_intensity_data[0],
-            self.tau_data[0]
-        ], dtype =np.float32)
+    # =========
+    # OCV + PHYSICS HELPERS
+    # =========
+    def _get_ocv_pack(self, soc: float) -> float:
+        """Get pack open-circuit voltage from SoC using lookup table."""
+        soc_clipped = float(
+            np.clip(soc, self.ocv_soc_points[0], self.ocv_soc_points[-1])
+        )
+        v_cell = np.interp(soc_clipped, self.ocv_soc_points, self.ocv_cell_volts)
+        return float(v_cell * self.N_cells)
+
+    def _compute_current_from_power(self, P_grid_W: float, V_oc_pack: float) -> float:
+        """
+        Solve P = I * (V_oc - I * R) for I, using R-int ECM:
+            R I^2 - V_oc I + P = 0
+        Use root:
+            I = (V_oc - sqrt(V_oc^2 - 4 R P)) / (2 R)
+        """
+        if P_grid_W == 0.0:
+            return 0.0
+
+        discriminant = V_oc_pack**2 - 4.0 * self.R_sys * P_grid_W
+        if discriminant < 0.0:
+            discriminant = 0.0  # numerical guard
+
+        I = (V_oc_pack - np.sqrt(discriminant)) / (2.0 * self.R_sys)
+        return float(I)
     
-    #NEED TO MAKE SURE THIS IS CORRECT
     def _get_obs(self):
         """
-        Convert the current internal state of the environment into the
-        observation vector expected by the agent.
-
-        Having this helper keeps the logic DRY because both `reset` and `step`
-        can simply call `_get_obs()` after mutating the internal members
-        (SoC, timestep, etc.) instead of duplicating array construction code.
+        Observation: [SoC, price_indicator, CI, tau, P_prev]
+        price_indicator uses SSP as a visible grid price feature.
         """
-        idx = int(np.clip(self.current_timestep, 0, len(self.sell_price_data) - 1))
+        idx = min(self.current_step, self.max_steps - 1)
 
-        obs = np.array(
+        return np.array(
             [
-                float(self.SoC),
-                float(self.sell_price_data[idx]),
-                float(self.carbon_intensity_data[idx]),
-                float(self.tau_data[idx]),
+                self.soc,
+                self.ssp_data[idx],
+                self.ci_data[idx],
+                self.tau_data[idx],
+                self.p_prev,
             ],
             dtype=np.float32,
         )
 
-        # Keep `self.state` in sync so any legacy code reading it directly
-        # still works, but return a copy to avoid unintentional mutations.
-        self.state = obs
-        return obs.copy()
+    # =========
+    # GYM API
+    # =========
+    def step(self, action_idx):
+        # 1. Map discrete action → direction {-1, 0, +1}
+        action_map = {0: -1, 1: 0, 2: 1}
+        if action_idx not in action_map:
+            raise ValueError(f"Invalid action index {action_idx}, must be 0,1,2.")
+        direction = action_map[action_idx]
 
-    def step(self, action):
-        """
-        Simulate one time step in the environment.
+        # Grid-side power in MW and W
+        P_grid_MW = direction * self.P_step_MW
+        P_grid_W = P_grid_MW * 1e6
 
-        Parameters
-        ------
-        action: float
-            The action to be taken, -1, 0 or 1.
+        # 2. Physics: compute current from power and OCV
+        V_oc_pack = self._get_ocv_pack(self.soc)
+        current_I = self._compute_current_from_power(P_grid_W, V_oc_pack)
 
-        Returns
-        ------
-        tuple
-            a tuple containing the new state, reward, done flag, and additional info.
-        """
-        # --- Unpack the current observation for downstream calculations ---
-        SoC, price, carbon_intensity, tau = self.state
-
-        # --- Actions that can be taken by Agent - Mapping Discrete action to Power ---
-        if action == 0: #charge
-            P_raw = -self.P_step # grid -> battery
-        elif  action == 1: #idle
-            P_raw = 0.0
-        elif action == 2: #discharging
-            P_raw = +self.P_step #battery -> grid
+        # 3. SoC update (Coulomb counting with efficiencies)
+        if current_I < 0.0:
+            # Charging (I < 0) → SoC increases, scaled by η_ch
+            delta_soc = -(current_I * self.dt_seconds / self.Q_pack_C) * self.eta_ch
         else:
-            raise ValueError("Invalid action")
+            # Discharging or idle (I >= 0) → SoC decreases, scaled by 1/η_dis
+            delta_soc = -(current_I * self.dt_seconds / self.Q_pack_C) / self.eta_dis
 
-        # --- Clamping Power by feasibility (SoC limits) ---
+        self.soc = float(np.clip(self.soc + delta_soc, self.SoC_min, self.SoC_max))
 
-        if P_raw < 0:
-            E_room = (self.SoC_max - self.SoC) * self.energy_max
-            E_step = abs(P_raw) * self.eff_ch * self.time_step
-            if E_step > E_room:
-                P_t = - E_room/(self.eff_ch * self.time_step)
-            else:
-                P_t = P_raw 
-        elif P_raw > 0:
-            E_room = (self.SoC - self.SoC_min) * self.energy_max  # Fixed: missing closing parenthesis
-            E_step = abs(P_raw) * self.time_step / self.eff_dis
-            if E_step > E_room:
-                P_t = (E_room * self.eff_dis) / self.time_step  # Fixed: E-room → E_room
-            else:
-                P_t = P_raw 
+        # 4. Reward calculation (profit + carbon penalty)
+        idx = self.current_step
+        ssp = float(self.ssp_data[idx])
+        sbp = float(self.sbp_data[idx])
+        ci_t = float(self.ci_data[idx])
+
+        # Energy traded (MWh): E = P [MW] * dt [h]
+        E_MWh = P_grid_MW * self.dt_hours
+
+        # Profit component
+        if P_grid_MW > 0.0:      # discharge → sell at SSP
+            profit = E_MWh * ssp
+        elif P_grid_MW < 0.0:    # charge → buy at SBP
+            profit = E_MWh * sbp
         else:
-            P_t = 0
+            profit = 0.0
 
-        # --- Updating SoC using update equation ---
+        # Carbon penalty: -λ (P_t · CI_t · Δt)  (literal MDP form)
+        carbon_penalty = -self.lambda_ci * (P_grid_MW * ci_t * self.dt_hours)
 
-        if P_t < 0: #charging
-            dSoC = (self.eff_ch * abs(P_t) * self.time_step) / self.energy_max  # Fixed: self.config.eff_ch → self.eff_ch
-            self.SoC = self.SoC *(1 - self.self_discharge) + dSoC
-        elif P_t > 0: #discharging
-            dSoC = (abs(P_t) * self.time_step) / (self.energy_max * self.eff_dis)
-            self.SoC = self.SoC*(1 - self.self_discharge) - dSoC
-        else: #idle
-            self.SoC = self.SoC*(1 - self.self_discharge) #self discharge BUT at the moment its at 0
+        reward = profit + carbon_penalty
+        self.reward = float(reward)
 
-        #clip the SoC, so that it doesnt go out of the min/max boundaries
-        self.SoC = float(np.clip(self.SoC, self.SoC_min, self.SoC_max))
+        # 5. Advance time & build next observation
+        self.p_prev = P_grid_MW
+        self.current_step += 1
 
-
-        # --- Computing Reward ---
-        #Reward = profit - lambda * carbon_cost
-
-        #energy traded this step:
-        delta_E = P_t * self.time_step #MWh
-
-        #Profit term
-        #when charging -> P_t < 0 -> you pay for electricity 
-        #when dicharging -> P_t > 0 -> you sell electricity 
-
-        buy_price = self.buy_price_data[self.current_timestep]
-        sell_price = self.sell_price_data[self.current_timestep]  # Fixed: self.self_price_data → self.sell_price_data
-
-        if P_t > 0: #discharging - you are selling 
-            profit_t = sell_price * delta_E
-        elif P_t < 0: #charging - paying for electricity
-            profit_t = buy_price * delta_E
-        else: #staying idle
-            profit_t = 0
-
-    
-        #Carbon Cost Term
-        ci_t = self.carbon_intensity_data[self.current_timestep]
-        lambda_ci = self.lambda_ci  # Fixed: use instance variable instead of config.lambda_ci
-
-        # convert gCO2/kWh → tCO2/MWh = (g/kWh) × (1e-6)
-        emission_intensity_t = ci_t * 1e-6
-
-        carbon_cost_t = lambda_ci * emission_intensity_t * (-delta_E)
-        #NOTE - we need to put a negative in front of the Delta_E as:
-        #Charging -> Delta_E < 0 -> We should decrease reward so increase value of Carbon Cost
-        #Discharging -> Delta_E > 0 -> We should increase reward so decrease value of Carbon Cost
-
-        #REWARD EQUATION
-        reward_t = profit_t - carbon_cost_t
-        self.reward = float(reward_t)
-    
-        #increment timestep
-        self.current_timestep += 1
-
-        #check if the end of the data is reached
-        if self.current_timestep >= len(self.sell_price_data):
-            terminated = True
-        else:
-            terminated = False
-        
+        terminated = self.current_step >= self.max_steps
         truncated = False
+
+        obs = self._get_obs()
+        return obs, self.reward, terminated, truncated, {}
+
+    def reset(self, seed=None, options=None):
+        """Reset environment to initial state."""
+        super().reset(seed=seed)
         
-        next_obs = self._get_obs()
-
-        #Returning the gymnasium step tuple
-        return next_obs, self.reward, terminated, truncated, {}
-
-
-    def close(self):
-        pass
+        self.current_step = 0
+        self.soc = self.SoC_initial
+        self.p_prev = 0.0
+        self.reward = 0.0
+        
+        obs = self._get_obs()
+        return obs, {}
