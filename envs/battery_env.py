@@ -2,60 +2,63 @@ import gymnasium as gym
 import pandas as pd
 import numpy as np
 from gymnasium import Env, spaces
-import config
+import env_config
 
 
 class BatteryEnv(Env):
-    def __init__(self, config):
+    def __init__(self, env_config):
         super().__init__()
 
         # ========
         # 1. HARDWARE & MDP PARAMETERS
         # ========
         # CATL EnerOne 1P416S
-        self.N_cells = config.N_cells
-        self.Q_cell_Ah = config.Q_cell
+        self.N_cells = env_config.N_cells
+        self.Q_cell_Ah = env_config.Q_cell
         # Pack charge (Coulombs): 280 Ah * 3600 s/h
-        self.Q_pack_C = config.Q_cell_C  # 1,008,000 C
-        self.V_nominal = config.V_nominal  # V
+        self.Q_pack_C = env_config.Q_cell_C  # 1,008,000 C
+        self.V_nominal = env_config.V_nominal  # V
+        self.E_nominal = env_config.E_nominal  # kWh
 
         # Operational limits (from your MDP)
-        self.SoC_min = config.SoC_min
-        self.SoC_max = config.SoC_max
-        self.SoC_initial = float(config.SoC_initial)
+        self.SoC_min = env_config.SoC_min
+        self.SoC_max = env_config.SoC_max
+        self.SoC_initial = float(env_config.SoC_initial)
 
         # Time step: 30 minutes
-        self.dt_hours = config.dt
+        self.dt_hours = env_config.dt
         self.dt_seconds = self.dt_hours * 3600.0
 
         # Efficiencies (from your MDP)
-        self.eta_ch = config.eff_ch   # charge efficiency
-        self.eta_dis = config.eff_dis    # discharge efficiency
+        self.eta_ch = env_config.eff_ch   # charge efficiency
+        self.eta_dis = env_config.eff_dis    # discharge efficiency
 
         # Power / action scaling
         # P_step ≈ 0.5C * E_nominal ≈ 0.186 MW (can be refined)
-        self.P_step_MW = config.P_step
+        self.P_step_MW = env_config.P_step
 
-        # Reward config: carbon weight λ
-        self.lambda_ci = float(config.lambda_ci)
+        # Reward env_config: carbon weight λ
+        self.lambda_ci = float(env_config.lambda_ci)
         
         # ECM R-int model parameter (internal resistance)
-        R_cell_mOhm = 0.35  # mΩ per cell (typical for 280Ah LFP)
+        R_cell_mOhm = 0.4  # mΩ per cell (from Product Specification Sheet)
         self.R_sys = (R_cell_mOhm / 1000.0) * self.N_cells  # Ω (pack resistance)
 
         # ========
-        # 2. OCV LOOKUP TABLE (HARDCODED, FROM YOUR DATA)
+        # 2. OCV LOOKUP TABLE (The DC OCV-SOC Curve from Spec Sheet @25°C)
         # ========
         self.ocv_soc_points = np.array(
             [0.00, 0.05, 0.10, 0.15, 0.20,
-             0.30, 0.40, 0.50, 0.60, 0.70,
-             0.80, 0.90, 0.95, 1.00],
+             0.25, 0.30, 0.35, 0.40, 0.45,
+             0.50, 0.55, 0.60, 0.65, 0.70,
+             0.75, 0.80, 0.85, 0.90, 0.95, 1.00],
             dtype=np.float32,
         )
         self.ocv_cell_volts = np.array(
-            [2.874, 3.193, 3.225, 3.252, 3.278,
-             3.304, 3.306, 3.309, 3.317, 3.342,
-             3.342, 3.342, 3.341, 3.352],
+            [2.893, 3.182, 3.205, 3.230, 3.250,
+             3.264, 3.283, 3.288, 3.288, 3.289, 
+             3.290, 3.293, 3.303, 3.327, 3.329,
+             3.329, 3.330, 3.330, 3.331, 3.332, 3.386],
             dtype=np.float32,
         )
 
@@ -136,6 +139,66 @@ class BatteryEnv(Env):
         I = (V_oc_pack - np.sqrt(discriminant)) / (2.0 * self.R_sys)
         return float(I)
     
+    def _clamp_power_by_soc_limits(self, P_grid_MW: float, soc: float) -> float:
+        """
+        Protection function: clamp power to prevent overcharging/overdischarging.
+        
+        Prevents SoC from exceeding [SoC_min, SoC_max] by limiting power command.
+        Uses simplified energy-based calculation to estimate maximum safe power.
+        
+        Parameters
+        ----------
+        P_grid_MW : float
+            Requested grid-side power (MW). P > 0 = discharge, P < 0 = charge
+        soc : float
+            Current state of charge (fraction)
+        
+        Returns
+        -------
+        float
+            Clamped power (MW) that won't violate SoC limits
+        """
+        if P_grid_MW == 0.0:
+            return 0.0
+        
+        # Get OCV for current SoC to estimate pack energy capacity
+        V_oc_pack = self._get_ocv_pack(soc)
+        E_nominal_MWh = self.E_nominal / 1000.0
+        
+        if P_grid_MW < 0.0:  # Charging
+            # Maximum SoC increase allowed
+            soc_room = self.SoC_max - soc
+            if soc_room <= 0.0:
+                return 0.0  # Already at max, cannot charge
+            
+            # Maximum energy we can add (MWh)
+            E_room_MWh = soc_room * E_nominal_MWh
+            
+            # Maximum charge power that fits in available room
+            # Account for charge efficiency: energy stored = P * dt * eta_ch
+            P_max_charge_MW = E_room_MWh / (self.eta_ch * self.dt_hours)
+            
+            # Clamp: P_grid_MW is negative, so we want max(negative, -positive) = less negative
+            P_clamped = max(P_grid_MW, -P_max_charge_MW)
+            
+        else: #Discharging
+            # Maximum SoC decrease allowed
+            soc_available = soc - self.SoC_min
+            if soc_available <= 0.0:
+                return 0.0  # Already at min, cannot discharge
+            
+            # Maximum energy we can extract (MWh)
+            E_available_MWh = soc_available * E_nominal_MWh
+            
+            # Maximum discharge power
+            # Account for discharge efficiency: energy delivered = P * dt / eta_dis
+            P_max_discharge_MW = (E_available_MWh * self.eta_dis) / self.dt_hours
+            
+            # Clamp to prevent overdischarging
+            P_clamped = min(P_grid_MW, P_max_discharge_MW)
+    
+        return float(P_clamped)
+    
     def _get_obs(self):
         """
         Observation: [SoC, price_indicator, CI, tau, P_prev]
@@ -165,7 +228,10 @@ class BatteryEnv(Env):
         direction = action_map[action_idx]
 
         # Grid-side power in MW and W
-        P_grid_MW = direction * self.P_step_MW
+        P_grid_MW_requested = direction * self.P_step_MW
+        
+        # Protection: clamp power to prevent overcharging/overdischarging
+        P_grid_MW = self._clamp_power_by_soc_limits(P_grid_MW_requested, self.soc)
         P_grid_W = P_grid_MW * 1e6
 
         # 2. Physics: compute current from power and OCV
@@ -180,7 +246,8 @@ class BatteryEnv(Env):
             # Discharging or idle (I >= 0) → SoC decreases, scaled by 1/η_dis
             delta_soc = -(current_I * self.dt_seconds / self.Q_pack_C) / self.eta_dis
 
-        self.soc = float(np.clip(self.soc + delta_soc, self.SoC_min, self.SoC_max))
+        # Update SoC (protection function should prevent violations, but clip as safety backup)
+        # self.soc = float(np.clip(self.soc + delta_soc, self.SoC_min, self.SoC_max))
 
         # 4. Reward calculation (profit + carbon penalty)
         idx = self.current_step
