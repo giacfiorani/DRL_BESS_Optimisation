@@ -60,21 +60,17 @@ class BatteryEnv(Env):
         # ========
         merged_data = pd.read_parquet("data/merged_data.parquet")
 
-        # Price datasets (£/MWh)
-        self.ssp_data = merged_data["ssp"].to_numpy(dtype=np.float32)  # Settlement Sell Price
-        self.sbp_data = merged_data["sbp"].to_numpy(dtype=np.float32)  # Settlement Buy Price
+        # Price dataset (£/MWh)
+        self.power_price = merged_data["price_gbp_mwh"].to_numpy(dtype=np.float32)  # Wholesale Power Price £/MWh
         
         # Carbon intensity dataset (gCO2/kWh)
         self.ci_data = merged_data["carbon_gco2_kwh"].to_numpy(dtype=np.float32)
         
         # Time encoding τ_t = hour * 2 + minute // 30
         self.timestamp = pd.to_datetime(merged_data["timestamp"])
-        self.tau_data = (
-            self.timestamp.dt.hour * 2
-            + (self.timestamp.dt.minute // 30)
-        ).to_numpy(dtype=np.int32)
+        self.tau_data = merged_data["tau"].to_numpy(dtype=np.int32)
 
-        self.max_steps = len(self.ssp_data)
+        self.max_steps = len(self.power_price)
 
         # ========
         # 4. INTERNAL ENV VARIABLES
