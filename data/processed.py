@@ -1,18 +1,12 @@
 import pandas as pd
+from data_loader import fetch_system_prices, fetch_carbon_sql
+from data_audit import audit_alignment
 
-from data_loader import (
-    fetch_system_price,
-    fetch_system_prices_day,
-    fetch_system_prices_range,
-    fetch_carbon_sql,
-    fetch_demand_window,
-    fetch_demand_range,
-)
 
-start = "2024-01-01"
-end   = "2024-03-01"
+start = "2021-01-01"
+end   = "2023-01-01"
 
-prices_df = fetch_system_prices_range(start, end)
+prices_df = fetch_system_prices(start, end)
 carbon_df = fetch_carbon_sql(start, end)
 
 # ---------- 1) Clean timestamps ----------
@@ -40,7 +34,7 @@ prices_df = clip(prices_df, start_common, end_common)
 carbon_df = clip(carbon_df, start_common, end_common)
 
 # Keep only relevant columns
-prices_df = prices_df.loc[:, ["timestamp", "ssp", "sbp", "niv"]]
+prices_df = prices_df.loc[:, ["timestamp", "price_gbp_mwh"]]
 carbon_df = carbon_df.loc[:, ["timestamp", "carbon_gco2_kwh"]]
 
 # ---------- 3) Merge ----------
@@ -55,10 +49,16 @@ merged_df = prices_df.merge(
 merged_df["date"] = merged_df["timestamp"].dt.date
 merged_df = merged_df.sort_values("timestamp").reset_index(drop=True)
 
-merged_df["tau"] = (
+merged_df["tau"] = ((
     merged_df["timestamp"].dt.hour * 2
-    + (merged_df["timestamp"].dt.minute // 30)
+    + (merged_df["timestamp"].dt.minute // 30)+1)
 )
 
-# ---------- 5) Save to parquet ----------
-merged_df.to_parquet("data/merged_data.parquet", index=False)
+# -----  5) Data Audit -----
+RUN_AUDIT = False  
+
+if RUN_AUDIT:
+    audit_alignment(prices_df, carbon_df)
+
+# ---------- 6) Save to parquet ----------
+merged_df.to_parquet("data/training_data.parquet", index=False)

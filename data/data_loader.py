@@ -3,103 +3,66 @@ import os, time, datetime as dt
 from typing import List, Dict, Any, Optional
 import requests
 import pandas as pd
+import eikon as ek
+import configparser as cp
+from eikon_rics_lists import DA_HH_RICS #import rics list for Wholesale prices 
 
-# ----- System Prices Data -----
+# all data date timezones are already in UTC 
 
-BASE = "https://data.elexon.co.uk/bmrs/api/v1"
+# ----- SYSTEM PRICE DATA -----
 
-def _headers():
-    """Use an API key if you have one (optional)."""
-    key = os.getenv("ELEXON_API_KEY", "").strip()
-    h = {"Accept": "application/json"}
-    if key:
-        h["x-api-key"] = key
-    return h
+# -- EIKON CONNECTION ---
 
-def fetch_system_price(settlement_date: str, settlement_period: int) -> Dict[str, Any] | None:
-    """
-    Fetch one settlement period for a given date.
-    settlement_date: 'YYYY-MM-DD'
-    settlement_period: 1..48 (46/50 on clock-change days)
-    Returns a dict (systemBuyPrice/systemSellPrice/...) or None if missing.
-    """
-    url = f"{BASE}/balancing/settlement/system-prices/{settlement_date}/{settlement_period}"
-    r = requests.get(url, headers=_headers(), timeout=20)
+def fetch_system_prices(start_date: str, end_date: str) -> pd.DataFrame:
+    cfg = cp.ConfigParser()
+    cfg.read("eikon.cfg")
 
-    if r.status_code == 200:
-        data = r.json()
-        # Some endpoints return {"data":[...]} while others return a list or dict
-        if isinstance(data, dict) and "data" in data:
-            data = data["data"]
-        if isinstance(data, list):
-            return data[0] if data else None
-        if isinstance(data, dict):
-            return data
-        return None
-    if r.status_code in (400, 404):
-        return None  # invalid/missing SP
-    if r.status_code == 429:         # rate limit
-        time.sleep(2.0)
-        return fetch_system_price(settlement_date, settlement_period)
-    r.raise_for_status()
+    ek.set_app_key(cfg["eikon"]["app_id"])
 
-def sp_to_halfhour_start(settlement_date: str, sp: int) -> pd.Timestamp:
-    d = pd.to_datetime(settlement_date)
-    return d + pd.to_timedelta((sp - 1) * 30, "m")
+    parts = {} #create empty price data dictionary - key=ric & value = time_series
+    sp_to_ric = {} #associate rics to the settlement period  (i.e. sp01)
 
-def fetch_system_prices_day(settlement_date: str) -> pd.DataFrame:
-    """Fetch all SPs for one date (tries 1..50), return a tidy DataFrame."""
-    rows: List[Dict[str, Any]] = []
-    for sp in range(1, 51):  # handles 46/48/50 SP days
-        rec = fetch_system_price(settlement_date, sp)
-        if rec is None:
-            continue
-        rec["_settlementDate"] = settlement_date
-        rec["_settlementPeriod"] = sp
-        rec["timestamp"] = sp_to_halfhour_start(settlement_date, sp)
-        rows.append(rec)
+    #since when doing it all in once, creates merging issues, we loop through the ric to output its timeseries one at a time
+    for i, r in enumerate(DA_HH_RICS, start=1):
+        sp = f"sp_{i:02d}" 
+        ts = ek.get_timeseries(rics=r, 
+        start_date=start_date,
+        end_date=end_date,
+        fields=["CLOSE"]).sort_index()
 
-    if not rows:
-        return pd.DataFrame(columns=[
-            "timestamp","_settlementDate","_settlementPeriod",
-            "systemSellPrice","systemBuyPrice","netImbalanceVolume"
-        ])
+        #set columns to settlement periods (sp01,...)
+        col = "CLOSE" if "CLOSE" in ts.columns else ts.columns[0]
+        ts = ts.rename(columns={col: sp})
 
-    df = pd.DataFrame(rows)
+        parts[sp] = ts
+        sp_to_ric[sp] = r
 
-    # Short, consistent column names
-    rename = {
-        "systemSellPrice": "ssp",
-        "systemBuyPrice":  "sbp",
-        "netImbalanceVolume": "niv",
-        "createdDateTime": "createdDateTime",
-    }
-    for k, v in rename.items():
-        if k in df.columns:
-            df = df.rename(columns={k: v})
+    #Concatenate the dictionary 
+    price_data = pd.concat([parts[sp] for sp in sorted(parts.keys())], axis=1).sort_index()
+    #dropping incomplete days  
+    complete_price_data= price_data.dropna(how="any")
 
-    df = df.sort_values("timestamp").reset_index(drop=True)
-    # Keep key fields first, then any totals the API returns
-    return df[[
-        "timestamp","_settlementDate","_settlementPeriod",
-        *(c for c in ["ssp","sbp","niv","createdDateTime"] if c in df.columns),
-        *[c for c in df.columns if c.startswith("total")]
-    ]]
+    # make delivery_date an explicit column for melt
+    complete_price_data.index.name = "delivery_date"
+    wide = complete_price_data.reset_index()
 
-def fetch_system_prices_range(start_date: str, end_date: str, sleep_s: float = 0.1) -> pd.DataFrame:
-    """Inclusive range 'YYYY-MM-DD' → merged DataFrame."""
-    start = dt.date.fromisoformat(start_date)
-    end   = dt.date.fromisoformat(end_date)
-    dfs: List[pd.DataFrame] = []
-    d = start
-    while d <= end:
-        df_day = fetch_system_prices_day(d.isoformat())
-        if not df_day.empty:
-            dfs.append(df_day)
-        time.sleep(sleep_s)  # polite spacing
-        d += dt.timedelta(days=1)
-    return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
+    # wide -> long
+    wholesale_data = wide.melt(
+        id_vars=["delivery_date"],
+        var_name="sp",
+        value_name="price_gbp_mwh"
+    ).sort_values(["delivery_date", "sp"]).reset_index(drop=True)
 
+    # sp_01 -> 1, ..., sp_48 -> 48
+    wholesale_data["settlement_period"] = wholesale_data["sp"].str.extract(r"(\d+)").astype(int)
+
+    #create timestamp column : day + hour + minutes in UTC timezone
+    wholesale_data["timestamp"] = (
+        pd.to_datetime(wholesale_data["delivery_date"], utc=True)
+        + pd.to_timedelta((wholesale_data["settlement_period"] - 1) * 30, unit="min")
+    )
+
+    return wholesale_data
 
 # ----- Carbon Intensity Data -----
 
@@ -132,7 +95,7 @@ def fetch_carbon_sql(start_date: str, end_date: str) -> pd.DataFrame:
     df.columns = [c.lower() for c in df.columns]
     # Timestamp column (common candidates: "from", "datetime")
     ts_col = "from" if "from" in df.columns else "datetime"
-    df["timestamp"] = pd.to_datetime(df[ts_col], errors="coerce")
+    df["timestamp"] = pd.to_datetime(df[ts_col], errors="coerce", utc=True)
 
     # Intensity column (common candidates)
     if "carbon_intensity" in df.columns:
@@ -157,92 +120,92 @@ def fetch_carbon_sql(start_date: str, end_date: str) -> pd.DataFrame:
            .reset_index(drop=True))
     return out
 
-# ----- Demand Data - Acutal Load -----
+# ----- Demand Data - Acutal Load ----- DONT KEEP FOR NOW
 
-def fetch_demand_window(
-    date_from: str,  # 'YYYY-MM-DD'
-    date_to: str,    # 'YYYY-MM-DD' (exclusive end or same-day for <=7d)
-    sp_from: Optional[int] = None,
-    sp_to: Optional[int] = None,
-) -> pd.DataFrame:
-    """
-    Calls /demand/actual/total?from=YYYY-MM-DD&to=YYYY-MM-DD[&settlementPeriodFrom=..&settlementPeriodTo=..]
-    The API supports a max window of 7 days per request.
-    Returns columns: timestamp (datetime), settlementDate, settlementPeriod, demand_mw
-    """
-    url = f"{BASE}/demand/actual/total"
-    params: Dict[str, Any] = {"from": date_from, "to": date_to, "format": "json"}
-    if sp_from is not None:
-        params["settlementPeriodFrom"] = sp_from
-    if sp_to is not None:
-        params["settlementPeriodTo"] = sp_to
+# def fetch_demand_window(
+#     date_from: str,  # 'YYYY-MM-DD'
+#     date_to: str,    # 'YYYY-MM-DD' (exclusive end or same-day for <=7d)
+#     sp_from: Optional[int] = None,
+#     sp_to: Optional[int] = None,
+# ) -> pd.DataFrame:
+#     """
+#     Calls /demand/actual/total?from=YYYY-MM-DD&to=YYYY-MM-DD[&settlementPeriodFrom=..&settlementPeriodTo=..]
+#     The API supports a max window of 7 days per request.
+#     Returns columns: timestamp (datetime), settlementDate, settlementPeriod, demand_mw
+#     """
+#     url = f"{BASE}/demand/actual/total"
+#     params: Dict[str, Any] = {"from": date_from, "to": date_to, "format": "json"}
+#     if sp_from is not None:
+#         params["settlementPeriodFrom"] = sp_from
+#     if sp_to is not None:
+#         params["settlementPeriodTo"] = sp_to
 
-    r = requests.get(url, headers=_headers(), params=params, timeout=30)
-    r.raise_for_status()
-    payload = r.json()
+#     r = requests.get(url, headers=_headers(), params=params, timeout=30)
+#     r.raise_for_status()
+#     payload = r.json()
 
-    data = payload.get("data", [])
-    if not data:
-        return pd.DataFrame(columns=["timestamp","settlementDate","settlementPeriod","demand_mw"])
+#     data = payload.get("data", [])
+#     if not data:
+#         return pd.DataFrame(columns=["timestamp","settlementDate","settlementPeriod","demand_mw"])
 
-    df = pd.DataFrame(data)
-    # Normalise columns
-    if "startTime" in df.columns:
-        ts = pd.to_datetime(df["startTime"], errors="coerce")
-    elif "timestamp" in df.columns:
-        ts = pd.to_datetime(df["timestamp"], errors="coerce")
-    else:
-        raise KeyError(f"No time column in demand payload: {df.columns.tolist()}")
+#     df = pd.DataFrame(data)
+#     # Normalise columns
+#     if "startTime" in df.columns:
+#         ts = pd.to_datetime(df["startTime"], errors="coerce")
+#     elif "timestamp" in df.columns:
+#         ts = pd.to_datetime(df["timestamp"], errors="coerce")
+#     else:
+#         raise KeyError(f"No time column in demand payload: {df.columns.tolist()}")
 
-    qty_col = "quantity" if "quantity" in df.columns else None
-    if qty_col is None:
-        # fall back to the first numeric column if schema changes
-        nums = df.select_dtypes("number").columns.tolist()
-        if not nums:
-            raise KeyError("No numeric demand column found in demand payload")
-        qty_col = nums[0]
+#     qty_col = "quantity" if "quantity" in df.columns else None
+#     if qty_col is None:
+#         # fall back to the first numeric column if schema changes
+#         nums = df.select_dtypes("number").columns.tolist()
+#         if not nums:
+#             raise KeyError("No numeric demand column found in demand payload")
+#         qty_col = nums[0]
 
-    out = pd.DataFrame({
-        "timestamp": ts,
-        "settlementDate": df.get("settlementDate"),
-        "settlementPeriod": df.get("settlementPeriod"),
-        "demand_mw": pd.to_numeric(df[qty_col], errors="coerce"),
-    }).dropna(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+#     out = pd.DataFrame({
+#         "timestamp": ts,
+#         "settlementDate": df.get("settlementDate"),
+#         "settlementPeriod": df.get("settlementPeriod"),
+#         "demand_mw": pd.to_numeric(df[qty_col], errors="coerce"),
+#     }).dropna(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
 
-    return out
+#     return out
 
-def fetch_demand_range(
-    start_date: str,  # 'YYYY-MM-DD'
-    end_date: str,    # 'YYYY-MM-DD' (inclusive end handled below)
-    sp_from: Optional[int] = None,
-    sp_to: Optional[int] = None,
-) -> pd.DataFrame:
-    """
-    Fetches demand for an arbitrarily long period by chunking into <=7-day windows.
-    Returns tidy DataFrame with columns: timestamp, settlementDate, settlementPeriod, demand_mw
-    """
-    d0 = dt.date.fromisoformat(start_date)
-    d1 = dt.date.fromisoformat(end_date)
-    # Make d1 exclusive by adding 1 day when we form the final chunk bound
-    end_excl = d1 + dt.timedelta(days=1)
+# def fetch_demand_range(
+#     start_date: str,  # 'YYYY-MM-DD'
+#     end_date: str,    # 'YYYY-MM-DD' (inclusive end handled below)
+#     sp_from: Optional[int] = None,
+#     sp_to: Optional[int] = None,
+# ) -> pd.DataFrame:
+#     """
+#     Fetches demand for an arbitrarily long period by chunking into <=7-day windows.
+#     Returns tidy DataFrame with columns: timestamp, settlementDate, settlementPeriod, demand_mw
+#     """
+#     d0 = dt.date.fromisoformat(start_date)
+#     d1 = dt.date.fromisoformat(end_date)
+#     # Make d1 exclusive by adding 1 day when we form the final chunk bound
+#     end_excl = d1 + dt.timedelta(days=1)
 
-    frames: List[pd.DataFrame] = []
-    chunk_start = d0
-    while chunk_start < end_excl:
-        chunk_end = min(chunk_start + dt.timedelta(days=7), end_excl)
-        df_chunk = fetch_demand_window(
-            chunk_start.isoformat(),
-            chunk_end.isoformat(),
-            sp_from=sp_from, sp_to=sp_to
-        )
-        if not df_chunk.empty:
-            frames.append(df_chunk)
-        chunk_start = chunk_end
+#     frames: List[pd.DataFrame] = []
+#     chunk_start = d0
+#     while chunk_start < end_excl:
+#         chunk_end = min(chunk_start + dt.timedelta(days=7), end_excl)
+#         df_chunk = fetch_demand_window(
+#             chunk_start.isoformat(),
+#             chunk_end.isoformat(),
+#             sp_from=sp_from, sp_to=sp_to
+#         )
+#         if not df_chunk.empty:
+#             frames.append(df_chunk)
+#         chunk_start = chunk_end
 
-    if not frames:
-        return pd.DataFrame(columns=["timestamp","settlementDate","settlementPeriod","demand_mw"])
+#     if not frames:
+#         return pd.DataFrame(columns=["timestamp","settlementDate","settlementPeriod","demand_mw"])
 
-    df = pd.concat(frames, ignore_index=True)
-    # De-duplicate just in case of overlapping edges
-    df = df.drop_duplicates(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
-    return df
+#     df = pd.concat(frames, ignore_index=True)
+#     # De-duplicate just in case of overlapping edges
+#     df = df.drop_duplicates(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+#     return df
