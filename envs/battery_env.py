@@ -3,7 +3,7 @@ import pandas as pd
 import numpy as np
 from gymnasium import Env, spaces
 import env_config
-
+from data import traini
 
 class BatteryEnv(Env):
     def __init__(self, env_config):
@@ -58,17 +58,17 @@ class BatteryEnv(Env):
         # ========
         # 3. LOAD DATA
         # ========
-        merged_data = pd.read_parquet("data/merged_data.parquet")
+        training_data = pd.read_parquet("data/training_data.parquet")
 
         # Price dataset (£/MWh)
-        self.power_price = merged_data["price_gbp_mwh"].to_numpy(dtype=np.float32)  # Wholesale Power Price £/MWh
+        self.power_price = training_data["price_gbp_mwh"].to_numpy(dtype=np.float32)  # Wholesale Power Price £/MWh
         
         # Carbon intensity dataset (gCO2/kWh)
-        self.ci_data = merged_data["carbon_gco2_kwh"].to_numpy(dtype=np.float32)
+        self.ci_data = training_data["carbon_gco2_kwh"].to_numpy(dtype=np.float32)
         
         # Time encoding τ_t = hour * 2 + minute // 30
-        self.timestamp = pd.to_datetime(merged_data["timestamp"])
-        self.tau_data = merged_data["tau"].to_numpy(dtype=np.int32)
+        self.timestamp = pd.to_datetime(training_data["timestamp"])
+        self.tau_data = training_data["tau"].to_numpy(dtype=np.int32)
 
         self.max_steps = len(self.power_price)
 
@@ -96,7 +96,7 @@ class BatteryEnv(Env):
             dtype=np.float32,
         )
         high = np.array(
-            [1.0, 500.0, 1000.0, 49.0, self.P_max_MW],
+            [1.0, 2500.0, 1000.0, 49.0, self.P_max_MW],
             dtype=np.float32,
         )
         self.observation_space = gym.spaces.Box(low=low, high=high, dtype=np.float32)
@@ -180,15 +180,14 @@ class BatteryEnv(Env):
     
     def _get_obs(self):
         """
-        Observation: [SoC, price_indicator, CI, tau, P_prev]
-        price_indicator uses SSP as a visible grid price feature.
+        Observation: [SoC, Price, CI, tau, P_prev]
         """
         idx = min(self.current_step, self.max_steps - 1)
 
         return np.array(
             [
                 self.soc,
-                self.ssp_data[idx],
+                self.power_price[idx],
                 self.ci_data[idx],
                 self.tau_data[idx],
                 self.p_prev,
@@ -226,8 +225,7 @@ class BatteryEnv(Env):
         
         # 4. Reward calculation (profit + carbon penalty)
         idx = self.current_step
-        ssp = float(self.ssp_data[idx])
-        sbp = float(self.sbp_data[idx])
+        price = float(self.power_price[idx])
         ci_t = float(self.ci_data[idx])
 
         # Energy traded (MWh): E = P [MW] * dt [h]
@@ -237,10 +235,10 @@ class BatteryEnv(Env):
         E_export_kWh = max(E_MWh, 0) * 1000   # discharging (energy exported to grid)
 
         # Profit component
-        if P_applied_MW > 0.0:      # discharge → sell at SSP
-            profit = E_MWh * ssp
-        elif P_applied_MW < 0.0:    # charge → buy at SBP
-            profit = E_MWh * sbp
+        if P_applied_MW > 0.0:      # discharge → sell
+            profit = E_MWh * price
+        elif P_applied_MW < 0.0:    # charge → buy
+            profit = E_MWh * price
         else:
             profit = 0.0
 
