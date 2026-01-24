@@ -16,54 +16,87 @@ from eikon_rics_lists import DA_HH_RICS #import rics list for Wholesale prices
 def fetch_system_prices(start_date: str, end_date: str) -> pd.DataFrame:
     cfg = cp.ConfigParser()
     cfg.read("eikon.cfg")
-
     ek.set_app_key(cfg["eikon"]["app_id"])
 
-    parts = {} #create empty price data dictionary - key=ric & value = time_series
-    sp_to_ric = {} #associate rics to the settlement period  (i.e. sp01)
+    parts = {}
+    sp_to_ric = {}
 
-    #since when doing it all in once, creates merging issues, we loop through the ric to output its timeseries one at a time
     for i, r in enumerate(DA_HH_RICS, start=1):
-        sp = f"sp_{i:02d}" 
-        ts = ek.get_timeseries(rics=r, 
-        start_date=start_date,
-        end_date=end_date,
-        fields=["CLOSE"]).sort_index()
+        sp = f"sp_{i:02d}"
 
-        #set columns to settlement periods (sp01,...)
+        ts = ek.get_timeseries(
+            rics=r,
+            start_date=start_date,
+            end_date=end_date,
+            fields=["CLOSE"],
+        )
+        if ts is None or len(ts) == 0:
+            raise RuntimeError(f"Eikon returned no data for {r} in [{start_date}, {end_date}]")
+
+        ts = ts.sort_index()
+
         col = "CLOSE" if "CLOSE" in ts.columns else ts.columns[0]
         ts = ts.rename(columns={col: sp})
 
         parts[sp] = ts
         sp_to_ric[sp] = r
 
-    #Concatenate the dictionary 
+    # 48 SP columns side-by-side; index is daily dates from Eikon
     price_data = pd.concat([parts[sp] for sp in sorted(parts.keys())], axis=1).sort_index()
-    #dropping incomplete days  
-    complete_price_data= price_data.dropna(how="any")
 
-    # make delivery_date an explicit column for melt
+    # drop incomplete delivery days (must have all 48 SPs)
+    complete_price_data = price_data.dropna(how="any").copy()
+
+    # index is the *delivery day* (daily)
+    complete_price_data.index = pd.to_datetime(complete_price_data.index, utc=True)
     complete_price_data.index.name = "delivery_date"
+
     wide = complete_price_data.reset_index()
 
-    # wide -> long
     wholesale_data = wide.melt(
         id_vars=["delivery_date"],
         var_name="sp",
-        value_name="price_gbp_mwh"
+        value_name="price_gbp_mwh",
     ).sort_values(["delivery_date", "sp"]).reset_index(drop=True)
 
-    # sp_01 -> 1, ..., sp_48 -> 48
-    wholesale_data["settlement_period"] = wholesale_data["sp"].str.extract(r"(\d+)").astype(int)
+    wholesale_data["settlement_period"] = (
+        wholesale_data["sp"].str.extract(r"(\d+)").astype(int)
+    )
 
-    #create timestamp column : day + hour + minutes in UTC timezone
-    wholesale_data["timestamp"] = (
-        pd.to_datetime(wholesale_data["delivery_date"], utc=True)
+    # ---- Build delivery timestamp (half-hour) ----
+    # delivery_date here is midnight UTC of delivery day
+    delivery_date = pd.to_datetime(wholesale_data["delivery_date"], utc=True)
+
+    wholesale_data["delivery_ts"] = (
+        delivery_date
         + pd.to_timedelta((wholesale_data["settlement_period"] - 1) * 30, unit="min")
     )
 
-    return wholesale_data
+    # ---- Trade timestamp (1 day before delivery) ----
+    wholesale_data["trade_ts"] = wholesale_data["delivery_ts"] - pd.Timedelta(days=1)
 
+    # Convenience day columns
+    wholesale_data["delivery_date"] = wholesale_data["delivery_ts"].dt.floor("D")
+    wholesale_data["trade_date"] = wholesale_data["trade_ts"].dt.floor("D")
+
+    # IMPORTANT: keep your pipeline stable: use "timestamp" = trade time ("now")
+    wholesale_data["timestamp"] = wholesale_data["trade_ts"]
+
+    # Optional: remove tz info for easier parquet handling downstream
+    for c in ["timestamp", "delivery_ts", "trade_ts", "delivery_date", "trade_date"]:
+        wholesale_data[c] = wholesale_data[c].dt.tz_convert(None)
+
+    return wholesale_data[
+        [
+            "timestamp",        # = trade_ts (the env's "now")
+            "delivery_ts",
+            "trade_ts",
+            "delivery_date",
+            "trade_date",
+            "settlement_period",
+            "price_gbp_mwh",
+        ]
+    ]
 # ----- Carbon Intensity Data -----
 
 URL = "https://api.neso.energy/api/3/action/datastore_search_sql"

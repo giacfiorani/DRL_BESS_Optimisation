@@ -2,7 +2,6 @@ import pandas as pd
 from data_loader import fetch_system_prices, fetch_carbon_sql
 from data_audit import audit_alignment
 
-
 start = "2021-01-01"
 end   = "2023-01-01"
 
@@ -10,13 +9,14 @@ prices_df = fetch_system_prices(start, end)
 carbon_df = fetch_carbon_sql(start, end)
 
 # ---------- 1) Clean timestamps ----------
-def clean_ts(df: pd.DataFrame) -> pd.DataFrame:
+def clean_ts(df: pd.DataFrame, ts_col: str = "timestamp") -> pd.DataFrame:
     df = df.copy()
-    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
-    df["timestamp"] = df["timestamp"].dt.tz_convert(None)
-    df = df.sort_values("timestamp")
-    df = df.drop_duplicates("timestamp")
-    df = df.reset_index(drop=True)
+    if ts_col not in df.columns:
+        raise KeyError(f"Expected column '{ts_col}' not found. Columns are: {list(df.columns)}")
+
+    df[ts_col] = pd.to_datetime(df[ts_col], utc=True)
+    df[ts_col] = df[ts_col].dt.tz_convert(None)
+    df = df.sort_values(ts_col).drop_duplicates(ts_col).reset_index(drop=True)
     return df
 
 prices_df = clean_ts(prices_df)
@@ -33,32 +33,49 @@ def clip(df: pd.DataFrame, start, end) -> pd.DataFrame:
 prices_df = clip(prices_df, start_common, end_common)
 carbon_df = clip(carbon_df, start_common, end_common)
 
-# Keep only relevant columns
-prices_df = prices_df.loc[:, ["timestamp", "price_gbp_mwh"]]
-carbon_df = carbon_df.loc[:, ["timestamp", "carbon_gco2_kwh"]]
-
-# ---------- 3) Merge ----------
+# ---------- 3) Merge on delivery timestamp ----------
 merged_df = prices_df.merge(
     carbon_df[["timestamp", "carbon_gco2_kwh"]],
     on="timestamp",
     how="inner",
 )
 
-# ---------- 4) Add tau per day ----------
-# timestamp is already datetime from clean_ts, so no need to reconvert
-merged_df["date"] = merged_df["timestamp"].dt.date
+# ---------- 4) Add explicit time columns ----------
 merged_df = merged_df.sort_values("timestamp").reset_index(drop=True)
 
-merged_df["tau"] = ((
-    merged_df["timestamp"].dt.hour * 2
-    + (merged_df["timestamp"].dt.minute // 30)+1)
+# timestamp is TRADE time (now)
+merged_df["trade_ts"] = merged_df["timestamp"]
+merged_df["trade_date"] = merged_df["trade_ts"].dt.floor("D")
+
+# delivery is tomorrow (same half-hour slot)
+merged_df["delivery_ts"] = merged_df["trade_ts"] + pd.Timedelta(days=1)
+merged_df["delivery_date"] = merged_df["delivery_ts"].dt.floor("D")
+
+# tau is defined on DELIVERY day
+merged_df["tau"] = (
+    merged_df["delivery_ts"].dt.hour * 2
+    + (merged_df["delivery_ts"].dt.minute // 30)
+    + 1
 )
 
-# -----  5) Data Audit -----
-RUN_AUDIT = False  
 
+
+# ---------- 5) Optional audit ----------
+RUN_AUDIT = False
 if RUN_AUDIT:
     audit_alignment(prices_df, carbon_df)
 
-# ---------- 6) Save to parquet ----------
+# ---------- 6) Save ----------
+merged_df = merged_df.drop(columns=["timestamp"])
+
+# reorder columns nicely
+cols = [
+    "trade_ts", "trade_date",
+    "delivery_ts", "delivery_date",
+    "tau",
+    "price_gbp_mwh",
+    "carbon_gco2_kwh",
+]
+merged_df = merged_df[cols]
+
 merged_df.to_parquet("data/training_data.parquet", index=False)
