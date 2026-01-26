@@ -39,8 +39,6 @@ lambda_ci = 0.9  # Carbon penalty weight (λ) - tunable scalar
 # For discrete action space, we need to define the number of power levels
 n_power_levels = 11
 
-ocv_table_size = 101 # 1001 points for 0.001 resolution
-
 # ========
 # OCV LOOKUP TABLE (The DC OCV-SOC Curve from Spec Sheet @25°C)
 # ========

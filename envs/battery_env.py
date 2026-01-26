@@ -375,10 +375,6 @@ class BatteryEnv(Env):
         P_req_MW = float(self.power_levels[dispatch_idx_eff])
         P_applied_MW, I_applied, V_oc_pack = self._apply_soc_protection(P_req_MW, self.soc)
 
-        # 1) DISPATCH NOW (use DA commitment if it exists)
-  
-        P_applied_MW, I_applied, V_oc_pack = self._apply_soc_protection(P_req_MW, self.soc)
-
         if I_applied < 0.0:
             delta_soc = -(I_applied * self.dt_seconds / self.Q_pack_C) * self.eta_ch
         elif I_applied > 0.0:
