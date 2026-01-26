@@ -3,20 +3,62 @@ import pandas as pd
 import numpy as np
 from gymnasium import Env, spaces
 import env_config
-from data import traini
+from pathlib import Path
+
+
 
 class BatteryEnv(Env):
-    def __init__(self, env_config):
+
+    """
+    Overlap (realistic) environment:
+      - 1 step = 1 half-hour in real time.
+      - Every step: dispatch now (SoC + reward).
+      - Also every step: optionally update tomorrow's DA plan at the same tau,
+        but ONLY after publish time.
+
+    Observation includes:
+      - current spot/settlement price (proxy = price_gbp_mwh)
+      - SoC, tau, previous power
+      - DA availability flag
+      - tomorrow DA curve (48 prices) visible only after publish time (else zeros)
+
+    Action:
+      - MultiDiscrete [dispatch_now_idx, plan_tomorrow_idx]
+        dispatch_now_idx: applied immediately
+        plan_tomorrow_idx: written into tomorrow_plan[tau] only if DA is available
+    """
+
+    metadata = {"render_modes": []}
+
+    def __init__(
+        self,
+        env_config,
+        publish_hour: int = 13,
+        episode_days: int = 30,
+        randomize_init_soc: bool = True,
+        init_soc_low: float = 0.3,   # if None -> use SoC_min
+        init_soc_high: float = 0.7,  # if None -> use SoC_max
+        spot_price_col: str = "price_gbp_mwh",
+        da_price_col: str = "price_gbp_mwh",
+        seed: int | None = None,
+    ):
         super().__init__()
+
+        # -----------------
+        # Config
+        # -----------------
+        self.publish_hour = int(publish_hour)
+        self.episode_days = int(episode_days)
+        self.randomize_init_soc = bool(randomize_init_soc)
+        self.np_random = np.random.default_rng(seed)
 
         # ========
         # 1. HARDWARE & MDP PARAMETERS
         # ========
         # CATL EnerOne 1P416S
         self.N_cells = env_config.N_cells
-        self.Q_cell_Ah = env_config.Q_cell
         # Pack charge (Coulombs): 280 Ah * 3600 s/h
-        self.Q_pack_C = env_config.Q_cell_C  # 1,008,000 C
+        self.Q_pack_C = env_config.Q_cell_C # 1,008,000 C - Since 1P416S Q_cell = Q_pack
         self.V_nominal = env_config.V_nominal  # V
         self.E_nominal = env_config.E_nominal  # kWh
 
@@ -44,62 +86,124 @@ class BatteryEnv(Env):
         R_cell_mOhm = 0.4  # mΩ per cell (from Product Specification Sheet)
         self.R_sys = (R_cell_mOhm / 1000.0) * self.N_cells  # Ω (pack resistance)
 
+        # Init SoC range defaults to your operational limits
+        self.init_soc_low = float(self.SoC_min if init_soc_low is None else init_soc_low)
+        self.init_soc_high = float(self.SoC_max if init_soc_high is None else init_soc_high)
+
         # ========
         # Read from OCV Lookup Table and Interpolate to get OCV-SOC Curve
         # ========
         self.ocv_soc_points, self.ocv_cell_volts = env_config.ocv_lookup_table()
-        self.ocv_table_size = env_config.ocv_table_size
-        self.soc_grid = np.linspace(0.0, 1.0, self.ocv_table_size, dtype=np.float32)
-        self.ocv_cell_table = np.interp(
-            self.soc_grid, self.ocv_soc_points, self.ocv_cell_volts
-        ).astype(np.float32)
-        self.ocv_pack_table = (self.ocv_cell_table * self.N_cells).astype(np.float32)
-
-        # ========
-        # 3. LOAD DATA
-        # ========
-        training_data = pd.read_parquet("data/training_data.parquet")
-
-        # Price dataset (£/MWh)
-        self.power_price = training_data["price_gbp_mwh"].to_numpy(dtype=np.float32)  # Wholesale Power Price £/MWh
         
-        # Carbon intensity dataset (gCO2/kWh)
-        self.ci_data = training_data["carbon_gco2_kwh"].to_numpy(dtype=np.float32)
+        # ========
+        # 2. LOAD DATA
+        # ========
+
+        ROOT_DIR = Path(__file__).resolve().parents[1]
+        DATA_PATH = ROOT_DIR / "data" / "training_data.parquet"
+        df = pd.read_parquet(DATA_PATH).copy()
+
+        df["trade_ts"] = pd.to_datetime(df["trade_ts"]) # Trade Day Timestamp
+        df["delivery_ts"] = pd.to_datetime(df["delivery_ts"]) # Delivert Day Timestamp
+        df["trade_date"] = pd.to_datetime(df["trade_date"])  # Trade day (auction day)
+        df["delivery_date"] = pd.to_datetime(df["delivery_date"])  # Delivery day for each row (the day electricity is delivered)
+
+        df = df.sort_values("trade_ts").reset_index(drop=True)
+
+        # DA publish time is on the TRADE day at publish_hour
+        df["da_publish_ts"] = df["trade_date"] + pd.Timedelta(hours=self.publish_hour)
+
+        self.df = df
+
+        # Arrays for fast access
+        self.trade_ts = df["trade_ts"].to_numpy(dtype="datetime64[ns]")
+        self.delivery_ts = df["delivery_ts"].to_numpy(dtype="datetime64[ns]")
+        self.trade_date = df["trade_date"].to_numpy(dtype="datetime64[ns]")
+        self.delivery_date = df["delivery_date"].to_numpy(dtype="datetime64[ns]")
+        self.da_publish_ts = df["da_publish_ts"].to_numpy(dtype="datetime64[ns]")
+        self.tau = df["tau"].to_numpy(dtype=np.int32)  # 1..48
+        self.spot_price = df[spot_price_col].to_numpy(dtype=np.float32)
+        self.da_price = df[da_price_col].to_numpy(dtype=np.float32)
+        self.ci = df["carbon_gco2_kwh"].to_numpy(dtype=np.float32)
+
+        #====
+        # Build trade_date -> indices mapping (keep complete 48-slot trade days)
+        #===
+        day_to_idx = df.groupby("trade_date").indices
+        valid_days = []
+        day_indices = {}
+
+        for d, idxs in day_to_idx.items():
+            idxs = np.array(sorted(idxs), dtype=np.int64)
+            
+            # Must be exactly 48 rows
+            if len(idxs) != 48:
+                continue
+            
+            # Must contain tau 1..48
+            taus = df.loc[idxs, "tau"].to_numpy()
+            if set(taus.tolist()) != set(range(1, 49)):
+                continue
+            
+            # Must be exactly 30-min cadence
+            ts_day = df.loc[idxs, "trade_ts"].to_numpy(dtype="datetime64[ns]")
+            deltas = np.diff(ts_day).astype("timedelta64[m]").astype(int)
+            if not np.all(deltas == 30):
+                continue
+
+            d64 = np.datetime64(pd.Timestamp(d).floor("D"))
+            valid_days.append(d64)
+            day_indices[d64] = idxs
+
+        self.valid_days = np.array(sorted(valid_days), dtype="datetime64[ns]")
+        self.day_indices = day_indices
+        if len(self.valid_days) == 0:
+            raise ValueError("No valid 48-slot trade days found in training_data.parquet.")
+
+        # Map day -> position in valid_days for fast “next day” stepping
+        self.day_pos = {d: i for i, d in enumerate(self.valid_days)}
+
+        # ========
+        # 3) ACTION SPACE
+        # ========
+        self.power_levels = np.linspace(-self.P_max_MW, self.P_max_MW, self.n_power_levels).astype(np.float32)
+        # MultiDiscrete action: [dispatch_idx, plan_idx]
+        # - dispatch_idx: real-time dispatch action for the current slot (unless a DA commitment exists)
+        # - plan_idx: DA plan action to write into tomorrow_plan for the same tau (if DA is published)
+        self.action_space = gym.spaces.MultiDiscrete([self.n_power_levels, self.n_power_levels])
         
-        # Time encoding τ_t = hour * 2 + minute // 30
-        self.timestamp = pd.to_datetime(training_data["timestamp"])
-        self.tau_data = training_data["tau"].to_numpy(dtype=np.int32)
+        # ========
+        # 4) OBSERVATION SPACE
+        # ========
+        # obs = [SoC, spot_price_now, CI_now, tau_now, P_prev, da_available] + tomorrow_DA_curve_48
+        low_main = np.array([0.0, -300.0, 0.0, 1.0, -self.P_max_MW, 0.0], dtype=np.float32)
+        high_main = np.array([1.0, 2500.0, 1000.0, 48.0, self.P_max_MW, 1.0], dtype=np.float32)
 
-        self.max_steps = len(self.power_price)
+        # these define the min/max limits for each of the 48 entries of the “tomorrow DA price curve” that are included in the observation.
+        low_curve = np.full((48,), -300.0, dtype=np.float32)
+        high_curve = np.full((48,), 2500.0, dtype=np.float32)
+
+        self.observation_space = gym.spaces.Box(
+            low=np.concatenate([low_main, low_curve]),
+            high=np.concatenate([high_main, high_curve]),
+            dtype=np.float32,
+        )
 
         # ========
-        # 4. INTERNAL ENV VARIABLES
+        # 5) INTERNAL ENV VARIABLES
         # ========
-        self.current_step = 0
-        self.soc = self.SoC_initial
+        self.soc = float(self.SoC_initial)
         self.p_prev = 0.0
-        self.reward = 0.0
-        self.actions = []  
 
-        # ========
-        # 5. ACTION SPACE (DISCRETE)
-        # ========
-        self.power_levels = np.linspace(-self.P_max_MW, self.P_max_MW, self.n_power_levels)
-        self.action_space = gym.spaces.Discrete(env_config.n_power_levels)
+        self.days_done = 0
+        self.current_day = None
+        self.current_day_idxs = None
+        self.slot0 = 0  # 0..47
 
-        # ========
-        # 6. OBSERVATION SPACE
-        # ========
-        # [SoC_t, price_t, CI_t, τ_t, P_{t-1}]
-        low = np.array(
-            [0.0, -300.0, 0.0, 0.0, -self.P_max_MW],
-            dtype=np.float32,
-        )
-        high = np.array(
-            [1.0, 2500.0, 1000.0, 49.0, self.P_max_MW],
-            dtype=np.float32,
-        )
-        self.observation_space = gym.spaces.Box(low=low, high=high, dtype=np.float32)
+        # Rolling plans 
+        self.today_plan = np.full(48, -1, dtype=np.int32)  # -1 means “no commitment”  - commitments for current day
+        self.tomorrow_plan = np.full(48, -1, dtype=np.int32) # being built for next day
+        
 
     # =========
     # OCV + PHYSICS HELPERS
@@ -107,9 +211,13 @@ class BatteryEnv(Env):
     def _get_ocv_pack(self, soc: float) -> float:
         """Get pack open-circuit voltage from SoC using lookup table."""
         soc = float(np.clip(soc, 0.0, 1.0))
-        # Use floor to avoid index out of bounds, then clip to valid range
-        idx = int(np.clip(soc * (self.ocv_table_size - 1), 0, self.ocv_table_size - 1))
-        return float(self.ocv_pack_table[idx])
+        
+        #interpolate given SoC
+        ocv_cell = np.interp(
+            soc, self.ocv_soc_points, self.ocv_cell_volts
+        )
+        ocv_pack = ocv_cell * self.N_cells
+        return float(ocv_pack)
 
 
     def _compute_current_from_power(self, P_grid_W: float, V_oc_pack: float) -> float:
@@ -177,100 +285,204 @@ class BatteryEnv(Env):
         I_applied = self._compute_current_from_power(P_applied_MW * 1e6, V_oc)
 
         return P_applied_MW, float(I_applied), V_oc
-    
-    def _get_obs(self):
-        """
-        Observation: [SoC, Price, CI, tau, P_prev]
-        """
-        idx = min(self.current_step, self.max_steps - 1)
 
-        return np.array(
+        # ========
+        # DA availability + tomorrow curve
+        # ========
+    
+    def _da_available_now(self, idx:int) -> bool:
+        return self.trade_ts[idx] >= self.da_publish_ts[idx]
+
+    def _get_tomorrow_da_curve(self) -> np.ndarray:
+        # At trade day D, the DA curve corresponds to delivery day D+1,
+        # and it lives in the current trade day's rows.
+        idxs = self.current_day_idxs
+        return self.da_price[idxs].astype(np.float32)
+
+    def _get_obs(self) -> np.ndarray:
+        idx = int(self.current_day_idxs[self.slot0])
+
+        now_ts = self.trade_ts[idx]
+        tau_now = float(self.tau[idx])  # 1..48
+
+        da_avail = 1.0 if self._da_available_now(idx) else 0.0
+        tomorrow_curve = self._get_tomorrow_da_curve() if da_avail else np.zeros(48, dtype=np.float32)
+
+        main = np.array(
             [
-                self.soc,
-                self.power_price[idx],
-                self.ci_data[idx],
-                self.tau_data[idx],
-                self.p_prev,
+                float(self.soc),
+                float(self.spot_price[idx]),
+                float(self.ci[idx]),
+                tau_now,
+                float(self.p_prev),
+                da_avail,
             ],
             dtype=np.float32,
         )
+        return np.concatenate([main, tomorrow_curve], axis=0)
+
+    
+    # -----------------
+    # Time advance
+    # -----------------
+    def _advance_one_slot(self):
+        self.slot0 += 1
+        if self.slot0 < 48:
+            return True  # still same day
+
+        # day rollover
+        self.slot0 = 0
+        self.days_done += 1
+
+        # shift plans: tomorrow plan becomes today's commitment
+        self.today_plan = self.tomorrow_plan.copy()
+        self.tomorrow_plan[:] = -1 # reset tomorrow plan buffer
+
+        # advance to next trade day in dataset
+        pos = self.day_pos[self.current_day]
+        nxt_pos = pos + 1
+        if nxt_pos >= len(self.valid_days):
+            return False  # dataset end
+
+        self.current_day = self.valid_days[nxt_pos]
+        self.current_day_idxs = self.day_indices[self.current_day]
+        return True
+
 
     # =========
     # GYM API
     # =========
-    def step(self, action_idx):
-
-        # Check if action index is valid
-        if not (0 <= action_idx < self.n_power_levels):
-            raise ValueError(f"Invalid action index {action_idx}, must be between 0 and {self.n_power_levels-1}.")
-
-        # Grid-side power in MW and W
-        P_requested_MW = self.power_levels[action_idx]
+    def step(self, action):
         
-        # Protection: clamp power to prevent overcharging/overdischarging
-        P_applied_MW, I_applied, V_oc_pack = self._apply_soc_protection(P_requested_MW, self.soc)
-        
-        # 3. SoC update (Coulomb counting with efficiencies)
+        dispatch_idx = int(action[0])
+        plan_idx = int(action[1])
+
+        if not (0 <= dispatch_idx < self.n_power_levels):
+            raise ValueError("dispatch_idx out of range")
+        if not (0 <= plan_idx < self.n_power_levels):
+            raise ValueError("plan_idx out of range")
+
+        # Current row
+        idx = int(self.current_day_idxs[self.slot0])
+        now_ts = self.trade_ts[idx]
+        tau0 = int(self.tau[idx]) - 1  # 0..47
+
+        # Choose executed dispatch
+        planned_idx = int(self.today_plan[tau0])
+        dispatch_idx_eff = planned_idx if planned_idx >= 0 else int(action[0])
+
+        # DISPATCH NOW (use dispatch_idx_eff)
+        P_req_MW = float(self.power_levels[dispatch_idx_eff])
+        P_applied_MW, I_applied, V_oc_pack = self._apply_soc_protection(P_req_MW, self.soc)
+
+        # 1) DISPATCH NOW (use DA commitment if it exists)
+  
+        P_applied_MW, I_applied, V_oc_pack = self._apply_soc_protection(P_req_MW, self.soc)
+
         if I_applied < 0.0:
-            # Charging (I < 0) → SoC increases, scaled by η_ch
             delta_soc = -(I_applied * self.dt_seconds / self.Q_pack_C) * self.eta_ch
         elif I_applied > 0.0:
-            # Discharging (I > 0) → SoC decreases, scaled by 1/η_dis
             delta_soc = -(I_applied * self.dt_seconds / self.Q_pack_C) / self.eta_dis
-        else:  # idle (I == 0)
+        else:
             delta_soc = 0.0
 
-        # Update SoC (protection function should prevent violations)
-        self.soc = self.soc + float(delta_soc)
-        
-        # 4. Reward calculation (profit + carbon penalty)
-        idx = self.current_step
-        price = float(self.power_price[idx])
-        ci_t = float(self.ci_data[idx])
+        self.soc = float(self.soc + delta_soc)
 
-        # Energy traded (MWh): E = P [MW] * dt [h]
+        # Reward (spot/settlement at current time)
+        price_now = float(self.spot_price[idx])
+        ci_now = float(self.ci[idx])
+
         E_MWh = P_applied_MW * self.dt_hours
+        profit = E_MWh * price_now
 
-        E_import_kWh = max(-E_MWh, 0) * 1000  # charging (energy imported from grid)
-        E_export_kWh = max(E_MWh, 0) * 1000   # discharging (energy exported to grid)
-
-        # Profit component
-        if P_applied_MW > 0.0:      # discharge → sell
-            profit = E_MWh * price
-        elif P_applied_MW < 0.0:    # charge → buy
-            profit = E_MWh * price
-        else:
-            profit = 0.0
-
-        # Carbon penalty: λ (E_imports - E_exports) · CI_t
-        # Charging (E_import > 0): positive penalty (penalizes carbon imports)
-        # Discharging (E_export > 0): negative penalty (rewards carbon exports)
-        carbon_penalty = self.lambda_ci * (E_import_kWh - E_export_kWh) * ci_t
+        E_import_kWh = max(-E_MWh, 0.0) * 1000.0
+        E_export_kWh = max(E_MWh, 0.0) * 1000.0
+        carbon_penalty = self.lambda_ci * (E_import_kWh - E_export_kWh) * ci_now
 
         reward = profit - carbon_penalty
-        self.reward = float(reward)
 
-        # 5. Advance time & build next observation
         self.p_prev = float(P_applied_MW)
-        self.current_step += 1
 
-        terminated = self.current_step >= self.max_steps
-        truncated = False
+        # 2) UPDATE TOMORROW PLAN (only if DA published)
+        da_avail = self._da_available_now(idx)
+        if da_avail:
+            self.tomorrow_plan[tau0] = int(plan_idx)   # plan_idx is action[1]
+
+        # 3) ADVANCE TIME
+        ok = self._advance_one_slot()
+
+        terminated = (self.days_done >= self.episode_days)
+        truncated = (not ok) and (not terminated)
 
         obs = self._get_obs()
-        return obs, self.reward, terminated, truncated, {
-            "P_requested_MW" : P_requested_MW,
-            "P_applied_MW" : P_applied_MW
+
+        info = {
+            "trade_ts": str(pd.Timestamp(now_ts)),
+            "trade_date": str(pd.Timestamp(self.trade_date[idx])),
+            "delivery_date": str(pd.Timestamp(self.delivery_date[idx])),
+            "tau": int(tau0 + 1),
+
+            "dispatch_idx_exec": int(dispatch_idx_eff),
+            "dispatch_idx_agent": int(action[0]),
+            "plan_idx_agent": int(action[1]),
+            "planned_idx_today" : int(planned_idx),
+
+            "P_req_MW": float(P_req_MW),
+            "P_applied_MW": float(P_applied_MW),
+            "delta_soc": float(delta_soc),
+
+            "price_now": float(price_now),
+            "ci_now": float(ci_now),
+            "profit": float(profit),
+            "carbon_penalty": float(carbon_penalty),
+
+            "da_available": bool(da_avail),
+            "days_done": int(self.days_done),
+            "soc": float(self.soc),
         }
 
+        return obs, float(reward), bool(terminated), bool(truncated), info
+        
+
     def reset(self, seed=None, options=None):
-        """Reset environment to initial state."""
         super().reset(seed=seed)
-        
-        self.current_step = 0
-        self.soc = self.SoC_initial
+
+        if seed is not None:
+            self.np_random = np.random.default_rng(seed)
+
+        # SoC reset at the start of an episode (training episodes) - so it doesnt become biased from starting at 0.5
+        if self.randomize_init_soc:
+            soc0 = float(self.np_random.uniform(self.init_soc_low, self.init_soc_high))
+            self.soc = float(np.clip(soc0, self.SoC_min, self.SoC_max))
+        else:
+            self.soc = float(np.clip(self.SoC_initial, self.SoC_min, self.SoC_max))
+
         self.p_prev = 0.0
-        self.reward = 0.0
-        
+        self.days_done = 0
+
+        # Choose starting day (enough room to run episode_days)
+        if options is not None and options.get("delivery_day") is not None:
+            start_day = np.datetime64(pd.to_datetime(options["delivery_day"]).floor("D"))
+            if start_day not in set(self.valid_days.tolist()):
+                raise ValueError("Requested delivery_day not in valid_days.")
+            start_pos = self.day_pos[start_day]
+        else:
+            max_start = max(len(self.valid_days) - self.episode_days, 1)
+            start_pos = int(self.np_random.integers(0, max_start))
+
+        self.current_day = self.valid_days[start_pos]
+        self.current_day_idxs = self.day_indices[self.current_day]
+        self.slot0 = 0
+
+        # Reset rolling plans
+        self.today_plan[:] = -1
+        self.tomorrow_plan[:] = -1
+
         obs = self._get_obs()
-        return obs, {}
+        info = {
+            "start_day": str(self.current_day),
+            "publish_hour": int(self.publish_hour),
+            "episode_days": int(self.episode_days),
+            "init_soc": float(self.soc),
+        }
+        return obs, info
