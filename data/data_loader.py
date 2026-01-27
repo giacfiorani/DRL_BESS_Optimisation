@@ -1,103 +1,273 @@
 from __future__ import annotations
 import os, time, datetime as dt
-from typing import List, Dict, Any, Optional
+from typing import Any, Dict, List, Optional, Sequence
 import requests
 import pandas as pd
 import eikon as ek
 import configparser as cp
-from eikon_rics_lists import DA_HH_RICS #import rics list for Wholesale prices 
+from eikon_rics_lists import DA_HH_RICS, SSP_RICS #import rics list for Wholesale prices 
 
 # all data date timezones are already in UTC 
 
+# =======
 # ----- SYSTEM PRICE DATA -----
+# ======
 
+##
 # -- EIKON CONNECTION ---
+# Day Ahead Prices from Refinitiv Workspace
+# System Buy and Sell Prices (SSP & SBP)
+# ===
+def fetch_48sp_curve(
+    start_date: str,
+    end_date: str,
+    rics: list[str],
+    *,
+    curve_name: str,          # e.g. "DA", "SSP", "SBP"
+    field: str = "CLOSE",
+    tz_naive: bool = True,
+) -> pd.DataFrame:
+    """
+    Fetch a 48-settlement-period daily curve from Eikon.
 
-def fetch_system_prices(start_date: str, end_date: str) -> pd.DataFrame:
+    Returns LONG dataframe with:
+      delivery_date (date), settlement_period (1..48), delivery_ts, trade_ts,
+      trade_date, price_gbp_mwh, curve_name
+
+    Important:
+      - Index returned by Eikon is assumed to be daily delivery date.
+      - We do NOT localize to UTC; we just normalize to midnight and then build SP timestamps.
+      - 'trade_ts' here is set to delivery_ts - 1 day (you can change later if needed).
+    """
+    if len(rics) != 48:
+        raise ValueError(f"{curve_name}: expected 48 RICs, got {len(rics)}")
+
     cfg = cp.ConfigParser()
     cfg.read("eikon.cfg")
     ek.set_app_key(cfg["eikon"]["app_id"])
 
-    parts = {}
-    sp_to_ric = {}
-
-    for i, r in enumerate(DA_HH_RICS, start=1):
-        sp = f"sp_{i:02d}"
-
+    parts = []
+    for sp, ric in enumerate(rics, start=1):
         ts = ek.get_timeseries(
-            rics=r,
+            rics=ric,
             start_date=start_date,
             end_date=end_date,
-            fields=["CLOSE"],
+            fields=[field],
         )
         if ts is None or len(ts) == 0:
-            raise RuntimeError(f"Eikon returned no data for {r} in [{start_date}, {end_date}]")
+            raise RuntimeError(f"Eikon returned no data for {ric} in [{start_date}, {end_date}]")
 
         ts = ts.sort_index()
 
-        col = "CLOSE" if "CLOSE" in ts.columns else ts.columns[0]
-        ts = ts.rename(columns={col: sp})
+        # column name handling
+        col = field if field in ts.columns else ts.columns[0]
+        s = ts[col].rename("price_gbp_mwh").to_frame()
 
-        parts[sp] = ts
-        sp_to_ric[sp] = r
+        s["settlement_period"] = sp
+        s["ric"] = ric
+        parts.append(s)
 
-    # 48 SP columns side-by-side; index is daily dates from Eikon
-    price_data = pd.concat([parts[sp] for sp in sorted(parts.keys())], axis=1).sort_index()
+    wide = pd.concat(parts, axis=0)
+    wide.index = pd.to_datetime(wide.index).normalize()
+    wide.index.name = "delivery_date"
 
-    # drop incomplete delivery days (must have all 48 SPs)
-    complete_price_data = price_data.dropna(how="any").copy()
+    df = wide.reset_index().sort_values(["delivery_date", "settlement_period"]).reset_index(drop=True)
 
-    # index is the *delivery day* (daily)
-    complete_price_data.index = pd.to_datetime(complete_price_data.index, utc=True)
-    complete_price_data.index.name = "delivery_date"
+    # Build timestamps (clock-day: SP1=00:00, SP48=23:30)
+    df["delivery_ts"] = df["delivery_date"] + pd.to_timedelta((df["settlement_period"] - 1) * 30, unit="min")
+    df["trade_ts"] = df["delivery_ts"] - pd.Timedelta(days=1)
+    df["trade_date"] = df["trade_ts"].dt.floor("D")
 
-    wide = complete_price_data.reset_index()
+    # Stable timestamp = delivery half-hour
+    df["timestamp"] = df["delivery_ts"]
 
-    wholesale_data = wide.melt(
-        id_vars=["delivery_date"],
-        var_name="sp",
-        value_name="price_gbp_mwh",
-    ).sort_values(["delivery_date", "sp"]).reset_index(drop=True)
+    df["curve_name"] = curve_name
 
-    wholesale_data["settlement_period"] = (
-        wholesale_data["sp"].str.extract(r"(\d+)").astype(int)
-    )
+    if tz_naive:
+        for c in ["timestamp", "delivery_ts", "trade_ts", "delivery_date", "trade_date"]:
+            df[c] = pd.to_datetime(df[c]).dt.tz_localize(None)
 
-    # ---- Build delivery timestamp (half-hour) ----
-    # delivery_date here is midnight UTC of delivery day
-    delivery_date = pd.to_datetime(wholesale_data["delivery_date"], utc=True)
-
-    wholesale_data["delivery_ts"] = (
-        delivery_date
-        + pd.to_timedelta((wholesale_data["settlement_period"] - 1) * 30, unit="min")
-    )
-
-    # ---- Trade timestamp (1 day before delivery) ----
-    wholesale_data["trade_ts"] = wholesale_data["delivery_ts"] - pd.Timedelta(days=1)
-
-    # Convenience day columns
-    wholesale_data["delivery_date"] = wholesale_data["delivery_ts"].dt.floor("D")
-    wholesale_data["trade_date"] = wholesale_data["trade_ts"].dt.floor("D")
-
-    # IMPORTANT: keep your pipeline stable: use "timestamp" = trade time ("now")
-    wholesale_data["timestamp"] = wholesale_data["trade_ts"]
-
-    # Optional: remove tz info for easier parquet handling downstream
-    for c in ["timestamp", "delivery_ts", "trade_ts", "delivery_date", "trade_date"]:
-        wholesale_data[c] = wholesale_data[c].dt.tz_convert(None)
-
-    return wholesale_data[
+    return df[
         [
-            "timestamp",        # = trade_ts (the env's "now")
+            "timestamp",
             "delivery_ts",
             "trade_ts",
             "delivery_date",
             "trade_date",
             "settlement_period",
             "price_gbp_mwh",
+            "curve_name",
+            "ric",
         ]
     ]
-# ----- Carbon Intensity Data -----
+
+# ====
+# Intraday Prices from Elexon
+# ====
+
+BASE = "https://data.elexon.co.uk/bmrs/api/v1"
+
+def _headers() -> Dict[str, str]:
+    """Use an API key if you have one (optional)."""
+    key = os.getenv("ELEXON_API_KEY", "").strip()
+    h = {"Accept": "application/json"}
+    if key:
+        h["x-api-key"] = key
+    return h
+
+def _get_json(url: str, params: Dict[str, Any], timeout: int = 30, max_retries: int = 8) -> Any:
+    """GET with 429 backoff."""
+    backoff = 1.0
+    for attempt in range(max_retries):
+        r = requests.get(url, headers=_headers(), params=params, timeout=timeout)
+        if r.status_code == 200:
+            return r.json()
+        if r.status_code == 429:
+            time.sleep(backoff)
+            backoff = min(backoff * 1.7, 15.0)
+            continue
+        if r.status_code in (400, 404):
+            return None
+        r.raise_for_status()
+    raise RuntimeError(f"Max retries exceeded for {url} with params={params}")
+
+def sp_to_halfhour_start(settlement_date: str, sp: int, tz: str = "Europe/London") -> pd.Timestamp:
+    """
+    Elexon settlement periods are half-hours. This builds the HH start timestamp.
+    NOTE: On DST days there can be 46 or 50 periods. Elexon handles it via sp range.
+    """
+    # Treat settlement_date as local clock day; keep as timezone-aware for safety
+    d = pd.Timestamp(settlement_date).tz_localize(tz)
+    ts = d + pd.to_timedelta((sp - 1) * 30, unit="min")
+    return ts
+
+def fetch_market_index(
+    from_dt: str,
+    to_dt: str,
+    data_providers: Optional[Sequence[str]] = None,
+    settlementPeriodFrom: Optional[int] = None,
+    settlementPeriodTo: Optional[int] = None,
+) -> pd.DataFrame:
+    """
+    Fetch Elexon Market Index Data (MID) time series.
+
+    Parameters
+    ----------
+    from_dt, to_dt : RFC3339 datetime strings (e.g. "2022-06-01T00:00Z")
+    data_providers : list like ["N2EXMIDP"] or ["APXMIDP"] or both; if None, fetch both.
+    settlementPeriodFrom/To : optional int 1..50; if provided, from/to are treated as settlement dates (time ignored).
+    """
+    url = f"{BASE}/balancing/pricing/market-index"
+
+    params: Dict[str, Any] = {"from": from_dt, "to": to_dt, "format": "json"}
+    if settlementPeriodFrom is not None:
+        params["settlementPeriodFrom"] = int(settlementPeriodFrom)
+    if settlementPeriodTo is not None:
+        params["settlementPeriodTo"] = int(settlementPeriodTo)
+
+    # Elexon expects repeated query args for arrays. requests supports list values.
+    if data_providers:
+        params["dataProviders"] = list(data_providers)
+
+    payload = _get_json(url, params=params)
+    if payload is None:
+        return pd.DataFrame()
+
+    # Most BMRS endpoints wrap rows in {"data":[...]}
+    rows = payload.get("data", payload) if isinstance(payload, dict) else payload
+    if not rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rows)
+
+    # Normalize typical column names (Elexon may use different names/casing)
+    # API can return marketIndexPrice/marketIndexVolume or price/volume
+    rename_map = {}
+    for c in df.columns:
+        lc = c.lower()
+        if lc == "settlementdate":
+            rename_map[c] = "settlementDate"
+        elif lc == "settlementperiod":
+            rename_map[c] = "settlementPeriod"
+        elif lc == "dataprovider":
+            rename_map[c] = "dataProvider"
+        elif lc == "marketindexprice" or lc == "price":
+            rename_map[c] = "marketIndexPrice"
+        elif lc == "marketindexvolume" or lc == "volume":
+            rename_map[c] = "marketIndexVolume"
+    if rename_map:
+        df = df.rename(columns=rename_map)
+
+    # Build timestamp from settlementDate + settlementPeriod
+    if "settlementDate" in df.columns and "settlementPeriod" in df.columns:
+        df["settlementDate"] = pd.to_datetime(df["settlementDate"]).dt.date.astype(str)
+        df["settlementPeriod"] = df["settlementPeriod"].astype(int)
+
+        df["timestamp"] = [
+            sp_to_halfhour_start(d, sp).tz_convert("UTC")
+            for d, sp in zip(df["settlementDate"], df["settlementPeriod"])
+        ]
+        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+
+    # Sort + tidy
+    sort_cols = [c for c in ["timestamp", "dataProvider", "settlementDate", "settlementPeriod"] if c in df.columns]
+    if sort_cols:
+        df = df.sort_values(sort_cols).reset_index(drop=True)
+
+    # Keep a nice front-of-table order; keep other fields after
+    front = [c for c in [
+        "timestamp",
+        "settlementDate",
+        "settlementPeriod",
+        "dataProvider",
+        "marketIndexPrice",
+        "marketIndexVolume",
+    ] if c in df.columns]
+    rest = [c for c in df.columns if c not in front]
+    df = df[front + rest]
+
+    return df
+
+def fetch_market_index_range_by_settlement_date(
+    start_date: str,
+    end_date: str,
+    data_providers: Optional[Sequence[str]] = None,
+    sleep_s: float = 0.15,
+) -> pd.DataFrame:
+    """
+    Convenience wrapper if you want to fetch by settlement date range.
+    Uses from/to as date filters (time ignored) by providing settlementPeriodFrom/To.
+
+    start_date/end_date: 'YYYY-MM-DD' inclusive
+    """
+    start = dt.date.fromisoformat(start_date)
+    end = dt.date.fromisoformat(end_date)
+
+    dfs: List[pd.DataFrame] = []
+    d = start
+    while d <= end:
+        # Query one day window (settlement date filtering makes time irrelevant)
+        from_dt = f"{d.isoformat()}T00:00Z"
+        to_dt = f"{(d + dt.timedelta(days=1)).isoformat()}T00:00Z"
+        df_day = fetch_market_index(
+            from_dt=from_dt,
+            to_dt=to_dt,
+            data_providers=data_providers,
+            settlementPeriodFrom=1,
+            settlementPeriodTo=50,
+        )
+        if not df_day.empty:
+            dfs.append(df_day)
+        time.sleep(sleep_s)
+        d += dt.timedelta(days=1)
+
+    return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
+
+
+
+#=========
+# ----- CARBON INTENSITY DATA -----
+#=======
 
 URL = "https://api.neso.energy/api/3/action/datastore_search_sql"
 RESOURCE_ID = "f93d1835-75bc-43e5-84ad-12472b180a98"  # Carbon intensity dataset ID
