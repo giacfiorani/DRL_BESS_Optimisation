@@ -1,5 +1,7 @@
+# RICS from Refinitiv Workspace
 
-#Wholesale Price data from LSEG - "EPX Great Britain Electricity Day Ahead Auction Half Hourly"
+
+# Wholesale Day Ahead (DA) Price data from LSEG - "EPX Great Britain Electricity Day Ahead Auction Half Hourly"
 DA_HH_RICS = [
     "EPXGBAUCD1H01H1", "EPXGBAUCD1H01H2",
     "EPXGBAUCD1H02H1", "EPXGBAUCD1H02H2",
@@ -25,4 +27,60 @@ DA_HH_RICS = [
     "EPXGBAUCD1H22H1", "EPXGBAUCD1H22H2",
     "EPXGBAUCD1H23H1", "EPXGBAUCD1H23H2",
     "EPXGBAUCD1H24H1", "EPXGBAUCD1H24H2",
+]
+
+# ELEXON System Sell Price (SSP) rics for sp1 to sp48
+SSP_RICS = [
+    "UKBM-SSP-P1", "UKBM-SSP-P2",
+    "UKBM-SSP-P3", "UKBM-SSP-P4",
+    "UKBM-SSP-P5", "UKBM-SSP-P6",
+    "UKBM-SSP-P7", "UKBM-SSP-P8",
+    "UKBM-SSP-P9", "UKBM-SSP-P10",
+    "UKBM-SSP-P11", "UKBM-SSP-P12",
+    "UKBM-SSP-P13", "UKBM-SSP-P14",
+    "UKBM-SSP-P15", "UKBM-SSP-P16",
+    "UKBM-SSP-P17", "UKBM-SSP-P18",
+    "UKBM-SSP-P19", "UKBM-SSP-P20",
+    "UKBM-SSP-P21", "UKBM-SSP-P22",
+    "UKBM-SSP-P23", "UKBM-SSP-P24",
+    "UKBM-SSP-P25", "UKBM-SSP-P26",
+    "UKBM-SSP-P27", "UKBM-SSP-P28",
+    "UKBM-SSP-P29", "UKBM-SSP-P30",
+    "UKBM-SSP-P31", "UKBM-SSP-P32",
+    "UKBM-SSP-P33", "UKBM-SSP-P34",
+    "UKBM-SSP-P35", "UKBM-SSP-P36",
+    "UKBM-SSP-P37", "UKBM-SSP-P38",
+    "UKBM-SSP-P39", "UKBM-SSP-P40",
+    "UKBM-SSP-P41", "UKBM-SSP-P42",
+    "UKBM-SSP-P43", "UKBM-SSP-P44",
+    "UKBM-SSP-P45", "UKBM-SSP-P46",
+    "UKBM-SSP-P47", "UKBM-SSP-P48",
+]
+
+# ELEXON System Buy Price (SBP) rics for sp1 to sp48
+SBP_RICS = [
+    "UKBM-SBP-P1", "UKBM-SBP-P2",
+    "UKBM-SBP-P3", "UKBM-SBP-P4",
+    "UKBM-SBP-P5", "UKBM-SBP-P6",
+    "UKBM-SBP-P7", "UKBM-SBP-P8",
+    "UKBM-SBP-P9", "UKBM-SBP-P10",
+    "UKBM-SBP-P11", "UKBM-SBP-P12",
+    "UKBM-SBP-P13", "UKBM-SBP-P14",
+    "UKBM-SBP-P15", "UKBM-SBP-P16",
+    "UKBM-SBP-P17", "UKBM-SBP-P18",
+    "UKBM-SBP-P19", "UKBM-SBP-P20",
+    "UKBM-SBP-P21", "UKBM-SBP-P22",
+    "UKBM-SBP-P23", "UKBM-SBP-P24",
+    "UKBM-SBP-P25", "UKBM-SBP-P26",
+    "UKBM-SBP-P27", "UKBM-SBP-P28",
+    "UKBM-SBP-P29", "UKBM-SBP-P30",
+    "UKBM-SBP-P31", "UKBM-SBP-P32",
+    "UKBM-SBP-P33", "UKBM-SBP-P34",
+    "UKBM-SBP-P35", "UKBM-SBP-P36",
+    "UKBM-SBP-P37", "UKBM-SBP-P38",
+    "UKBM-SBP-P39", "UKBM-SBP-P40",
+    "UKBM-SBP-P41", "UKBM-SBP-P42",
+    "UKBM-SBP-P43", "UKBM-SBP-P44",
+    "UKBM-SBP-P45", "UKBM-SBP-P46",
+    "UKBM-SBP-P47", "UKBM-SBP-P48",
 ]

@@ -37,7 +37,7 @@ def fetch_48sp_curve(
     Important:
       - Index returned by Eikon is assumed to be daily delivery date.
       - We do NOT localize to UTC; we just normalize to midnight and then build SP timestamps.
-      - 'trade_ts' here is set to delivery_ts - 1 day (you can change later if needed).
+      - 'trade_ts' here is set to delivery_ts - 1 day
     """
     if len(rics) != 48:
         raise ValueError(f"{curve_name}: expected 48 RICs, got {len(rics)}")
@@ -46,8 +46,11 @@ def fetch_48sp_curve(
     cfg.read("eikon.cfg")
     ek.set_app_key(cfg["eikon"]["app_id"])
 
-    parts = []
+    parts = [] # fetch each SP seperatly 
+
+    #loop through the 48 rics and align it to its settlement period (sp) number
     for sp, ric in enumerate(rics, start=1):
+        #dataframe indexed by date
         ts = ek.get_timeseries(
             rics=ric,
             start_date=start_date,
@@ -57,9 +60,9 @@ def fetch_48sp_curve(
         if ts is None or len(ts) == 0:
             raise RuntimeError(f"Eikon returned no data for {ric} in [{start_date}, {end_date}]")
 
-        ts = ts.sort_index()
+        ts = ts.sort_index() #ensures dataframe dates are stored ascending
 
-        # column name handling
+        # column name handling - if column not called CLOSE take the first column
         col = field if field in ts.columns else ts.columns[0]
         s = ts[col].rename("price_gbp_mwh").to_frame()
 
@@ -67,11 +70,13 @@ def fetch_48sp_curve(
         s["ric"] = ric
         parts.append(s)
 
+    # Stack all SP blocks vertically.
     wide = pd.concat(parts, axis=0)
-    wide.index = pd.to_datetime(wide.index).normalize()
+    wide.index = pd.to_datetime(wide.index).normalize() # convert to datetime
     wide.index.name = "delivery_date"
 
-    df = wide.reset_index().sort_values(["delivery_date", "settlement_period"]).reset_index(drop=True)
+   #sort sp so its in order fromm 1 to 48
+    df = wide.reset_index().sort_values(["delivery_date", "settlement_period"]).reset_index(drop=True) 
 
     # Build timestamps (clock-day: SP1=00:00, SP48=23:30)
     df["delivery_ts"] = df["delivery_date"] + pd.to_timedelta((df["settlement_period"] - 1) * 30, unit="min")
@@ -115,21 +120,24 @@ def _headers() -> Dict[str, str]:
         h["x-api-key"] = key
     return h
 
+# JSON get request function that handles rate limits
 def _get_json(url: str, params: Dict[str, Any], timeout: int = 30, max_retries: int = 8) -> Any:
     """GET with 429 backoff."""
-    backoff = 1.0
+    #try request up to 8 times
+    backoff = 1.0 
     for attempt in range(max_retries):
         r = requests.get(url, headers=_headers(), params=params, timeout=timeout)
-        if r.status_code == 200:
+        if r.status_code == 200: # success -> returned parsed JSON 
             return r.json()
-        if r.status_code == 429:
+        if r.status_code == 429: # too many requests -> wait and retry with exponential backoff.
             time.sleep(backoff)
             backoff = min(backoff * 1.7, 15.0)
             continue
-        if r.status_code in (400, 404):
+        if r.status_code in (400, 404): # If request is invalid or there’s no data → just return None rather than crashing.
             return None
         r.raise_for_status()
     raise RuntimeError(f"Max retries exceeded for {url} with params={params}")
+
 
 def sp_to_halfhour_start(settlement_date: str, sp: int, tz: str = "Europe/London") -> pd.Timestamp:
     """
@@ -141,6 +149,7 @@ def sp_to_halfhour_start(settlement_date: str, sp: int, tz: str = "Europe/London
     ts = d + pd.to_timedelta((sp - 1) * 30, unit="min")
     return ts
 
+# Fetches Market Index Data (MID), which are Intraday Prices
 def fetch_market_index(
     from_dt: str,
     to_dt: str,
@@ -154,10 +163,10 @@ def fetch_market_index(
     Parameters
     ----------
     from_dt, to_dt : RFC3339 datetime strings (e.g. "2022-06-01T00:00Z")
-    data_providers : list like ["N2EXMIDP"] or ["APXMIDP"] or both; if None, fetch both.
+    data_providers : list like ["N2EXMIDP"] or ["APXMIDP"] or both; if None, fetch both. 
     settlementPeriodFrom/To : optional int 1..50; if provided, from/to are treated as settlement dates (time ignored).
     """
-    url = f"{BASE}/balancing/pricing/market-index"
+    url = f"{BASE}/balancing/pricing/market-index" # endpoint
 
     params: Dict[str, Any] = {"from": from_dt, "to": to_dt, "format": "json"}
     if settlementPeriodFrom is not None:
@@ -169,13 +178,14 @@ def fetch_market_index(
     if data_providers:
         params["dataProviders"] = list(data_providers)
 
+    #extracts the list of rows
     payload = _get_json(url, params=params)
-    if payload is None:
+    if payload is None: 
         return pd.DataFrame()
 
     # Most BMRS endpoints wrap rows in {"data":[...]}
     rows = payload.get("data", payload) if isinstance(payload, dict) else payload
-    if not rows:
+    if not rows: # no rows then emptuy dataframe
         return pd.DataFrame()
 
     df = pd.DataFrame(rows)
@@ -203,6 +213,7 @@ def fetch_market_index(
         df["settlementDate"] = pd.to_datetime(df["settlementDate"]).dt.date.astype(str)
         df["settlementPeriod"] = df["settlementPeriod"].astype(int)
 
+        #build local London timestamp for sp
         df["timestamp"] = [
             sp_to_halfhour_start(d, sp).tz_convert("UTC")
             for d, sp in zip(df["settlementDate"], df["settlementPeriod"])
@@ -240,9 +251,11 @@ def fetch_market_index_range_by_settlement_date(
 
     start_date/end_date: 'YYYY-MM-DD' inclusive
     """
+    #turn string to dateformat
     start = dt.date.fromisoformat(start_date)
     end = dt.date.fromisoformat(end_date)
 
+    #iterate over each day
     dfs: List[pd.DataFrame] = []
     d = start
     while d <= end:
@@ -258,9 +271,10 @@ def fetch_market_index_range_by_settlement_date(
         )
         if not df_day.empty:
             dfs.append(df_day)
-        time.sleep(sleep_s)
+        time.sleep(sleep_s) # small sleep to not hammer API
         d += dt.timedelta(days=1)
-
+    
+    #stack all days
     return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
 
 
@@ -323,7 +337,7 @@ def fetch_carbon_sql(start_date: str, end_date: str) -> pd.DataFrame:
            .reset_index(drop=True))
     return out
 
-# ----- Demand Data - Acutal Load ----- DONT KEEP FOR NOW
+# ----- Demand Data - Actual Load ----- DONT KEEP FOR NOW
 
 # def fetch_demand_window(
 #     date_from: str,  # 'YYYY-MM-DD'

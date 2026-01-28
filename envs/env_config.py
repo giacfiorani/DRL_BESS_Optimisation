@@ -9,6 +9,8 @@ Q_cell_C = 280 * 3600  # C (Coulombs) for Coulomb counting: Q = 280 Ah × 3600 s
 V_nominal = 1331.2  # V (nominal pack voltage)
 E_nominal = 372.7  # kWh (nominal energy)
 E_max = 0.3727  # MWh (same as E_nominal, converted to MWh)
+R_cell_mOhm = 0.4 # mΩ per cell (from Product Specification Sheet)
+
 
 # ========
 # OPERATIONAL PARAMETERS
@@ -21,7 +23,7 @@ SoC_initial = 0.5  # Initial SoC (fraction) - set to mid-range for safety
 # EFFICIENCY PARAMETERS
 # ========
 eff_dis = 1.0  # Discharge efficiency (η_discharge = 1 per MDP)
-eff_ch = 0.99  # Charge efficiency (η_charge = 0.995 per MDP)
+eff_ch = 0.99  # Charge efficiency (η_charge = 0.99)
 self_dis = 0.0  # Self-discharge rate per timestep (set to 0 for simplicity)
 
 # ========

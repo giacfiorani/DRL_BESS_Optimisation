@@ -23,25 +23,25 @@ class BatteryEnv(Env):
       - tomorrow DA curve (48 prices) visible only after publish time (else zeros)
 
     Action:
-      - MultiDiscrete [dispatch_now_idx, plan_tomorrow_idx]
-        dispatch_now_idx: applied immediately
-        plan_tomorrow_idx: written into tomorrow_plan[tau] only if DA is available
+      - MultiDiscrete [dispatch_now_idx, plan_tomorrow_idx, plan_slot]
+        dispatch_now_idx: applied immediately (real-time dispatch)
+        plan_tomorrow_idx: power-level index to write into tomorrow_plan
+        plan_slot: slot index (0..47) of tomorrow_plan to write; only if DA is available
     """
-
+    
     metadata = {"render_modes": []}
 
     def __init__(
         self,
         env_config,
-        publish_hour: int = 13,
+        publish_hour: int = 12,
         episode_days: int = 30,
         randomize_init_soc: bool = True,
         init_soc_low: float = 0.3,   # if None -> use SoC_min
         init_soc_high: float = 0.7,  # if None -> use SoC_max
-        spot_price_col: str = "price_gbp_mwh",
-        da_price_col: str = "price_gbp_mwh",
         seed: int | None = None,
     ):
+        # env initialisation
         super().__init__()
 
         # -----------------
@@ -79,12 +79,12 @@ class BatteryEnv(Env):
         self.P_max_MW = env_config.P_max_MW
         self.n_power_levels = env_config.n_power_levels
 
-        # Reward env_config: carbon weight λ
+        # Reward config: carbon weight λ
         self.lambda_ci = float(env_config.lambda_ci)
         
         # ECM R-int model parameter (internal resistance)
-        R_cell_mOhm = 0.4  # mΩ per cell (from Product Specification Sheet)
-        self.R_sys = (R_cell_mOhm / 1000.0) * self.N_cells  # Ω (pack resistance)
+        self. R_cell_mOhm = env_config.R_cell_mOhm  # mΩ per cell
+        self.R_sys = (self.R_cell_mOhm / 1000.0) * self.N_cells  # Ω (pack resistance)
 
         # Init SoC range defaults to your operational limits
         self.init_soc_low = float(self.SoC_min if init_soc_low is None else init_soc_low)
@@ -104,11 +104,12 @@ class BatteryEnv(Env):
         df = pd.read_parquet(DATA_PATH).copy()
 
         df["trade_ts"] = pd.to_datetime(df["trade_ts"]) # Trade Day Timestamp
-        df["delivery_ts"] = pd.to_datetime(df["delivery_ts"]) # Delivert Day Timestamp
+        df["delivery_ts"] = pd.to_datetime(df["delivery_ts"])  # Delivery Day Timestamp
         df["trade_date"] = pd.to_datetime(df["trade_date"])  # Trade day (auction day)
         df["delivery_date"] = pd.to_datetime(df["delivery_date"])  # Delivery day for each row (the day electricity is delivered)
 
-        df = df.sort_values("trade_ts").reset_index(drop=True)
+        #index on delivery timestamp 
+        df = df.sort_values("delivery_ts").reset_index(drop=True)
 
         # DA publish time is on the TRADE day at publish_hour
         df["da_publish_ts"] = df["trade_date"] + pd.Timedelta(hours=self.publish_hour)
@@ -120,19 +121,20 @@ class BatteryEnv(Env):
         self.delivery_ts = df["delivery_ts"].to_numpy(dtype="datetime64[ns]")
         self.trade_date = df["trade_date"].to_numpy(dtype="datetime64[ns]")
         self.delivery_date = df["delivery_date"].to_numpy(dtype="datetime64[ns]")
-        self.da_publish_ts = df["da_publish_ts"].to_numpy(dtype="datetime64[ns]")
+        self.da_publish_ts = df["da_publish_ts"].to_numpy(dtype="datetime64[ns]") 
         self.tau = df["tau"].to_numpy(dtype=np.int32)  # 1..48
-        self.spot_price = df[spot_price_col].to_numpy(dtype=np.float32)
-        self.da_price = df[da_price_col].to_numpy(dtype=np.float32)
-        self.ci = df["carbon_gco2_kwh"].to_numpy(dtype=np.float32)
+        self.id_price = df["mid_price_gbp_mwh"].to_numpy(dtype=np.float32) # intraday prices data
+        self.da_price = df["da_price_gbp_mwh"].to_numpy(dtype=np.float32) # day ahead prices data
+        self.ci = df["carbon_gco2_kwh"].to_numpy(dtype=np.float32) # carbon intensity data
 
         #====
         # Build trade_date -> indices mapping (keep complete 48-slot trade days)
         #===
-        day_to_idx = df.groupby("trade_date").indices
+        day_to_idx = df.groupby("delivery_date").indices
         valid_days = []
         day_indices = {}
 
+        #loop through each day 
         for d, idxs in day_to_idx.items():
             idxs = np.array(sorted(idxs), dtype=np.int64)
             
@@ -146,15 +148,16 @@ class BatteryEnv(Env):
                 continue
             
             # Must be exactly 30-min cadence
-            ts_day = df.loc[idxs, "trade_ts"].to_numpy(dtype="datetime64[ns]")
+            ts_day = df.loc[idxs, "delivery_ts"].to_numpy(dtype="datetime64[ns]")
             deltas = np.diff(ts_day).astype("timedelta64[m]").astype(int)
             if not np.all(deltas == 30):
                 continue
-
+            #store the day 
             d64 = np.datetime64(pd.Timestamp(d).floor("D"))
             valid_days.append(d64)
             day_indices[d64] = idxs
-
+        
+        #ensure dataset has valid complete days
         self.valid_days = np.array(sorted(valid_days), dtype="datetime64[ns]")
         self.day_indices = day_indices
         if len(self.valid_days) == 0:
@@ -167,22 +170,24 @@ class BatteryEnv(Env):
         # 3) ACTION SPACE
         # ========
         self.power_levels = np.linspace(-self.P_max_MW, self.P_max_MW, self.n_power_levels).astype(np.float32)
-        # MultiDiscrete action: [dispatch_idx, plan_idx]
-        # - dispatch_idx: real-time dispatch action for the current slot (unless a DA commitment exists)
+        # MultiDiscrete action: [dispatch_idx, plan_idx, plan_slot]
+        # - dispatch_idx: real-time dispatch action for the current slot 
         # - plan_idx: DA plan action to write into tomorrow_plan for the same tau (if DA is published)
-        self.action_space = gym.spaces.MultiDiscrete([self.n_power_levels, self.n_power_levels])
+        # - plan_slot (0..47): which slot of tomorrow_plan to write
+        self.action_space = gym.spaces.MultiDiscrete([self.n_power_levels, self.n_power_levels, 48])
         
         # ========
         # 4) OBSERVATION SPACE
         # ========
         # obs = [SoC, spot_price_now, CI_now, tau_now, P_prev, da_available] + tomorrow_DA_curve_48
-        low_main = np.array([0.0, -300.0, 0.0, 1.0, -self.P_max_MW, 0.0], dtype=np.float32)
-        high_main = np.array([1.0, 2500.0, 1000.0, 48.0, self.P_max_MW, 1.0], dtype=np.float32)
+        low_main  = np.array([0.0, -300.0, 0.0, 1.0, -self.P_max_MW, 0.0, -self.P_max_MW], dtype=np.float32)
+        high_main = np.array([1.0, 2500.0, 1000.0, 48.0,  self.P_max_MW, 1.0,  self.P_max_MW], dtype=np.float32)
 
         # these define the min/max limits for each of the 48 entries of the “tomorrow DA price curve” that are included in the observation.
         low_curve = np.full((48,), -300.0, dtype=np.float32)
         high_curve = np.full((48,), 2500.0, dtype=np.float32)
 
+        # Total Obs length = 48 + 7 = 55 floats
         self.observation_space = gym.spaces.Box(
             low=np.concatenate([low_main, low_curve]),
             high=np.concatenate([high_main, high_curve]),
@@ -210,8 +215,8 @@ class BatteryEnv(Env):
     # =========
     def _get_ocv_pack(self, soc: float) -> float:
         """Get pack open-circuit voltage from SoC using lookup table."""
-        soc = float(np.clip(soc, 0.0, 1.0))
-        
+        soc = float(np.clip(soc, 0.0, 1.0)) #safety net to keep SoC between 0 and 1
+
         #interpolate given SoC
         ocv_cell = np.interp(
             soc, self.ocv_soc_points, self.ocv_cell_volts
@@ -254,7 +259,7 @@ class BatteryEnv(Env):
 
         # 2) compute requested current from requested power
         V_oc = self._get_ocv_pack(soc)
-        I_req = self._compute_current_from_power(P_req_MW * 1e6, V_oc)
+        I_req = self._compute_current_from_power(P_req_MW * 1e6, V_oc) 
 
         # 3) allowable SoC movement this step
         delta_soc_up_max   = max(self.SoC_max - soc, 0.0)  # room to charge
@@ -269,7 +274,7 @@ class BatteryEnv(Env):
         dt = self.dt_seconds
         Q  = self.Q_pack_C
 
-        # Your SoC update rule is:
+        # The SoC update rule is:
         # charge (I<0): ΔSoC = -(I dt / Q) * η_ch
         # discharge(I>0): ΔSoC = -(I dt / Q) / η_dis
         # So invert those to get current bounds:
@@ -286,37 +291,45 @@ class BatteryEnv(Env):
 
         return P_applied_MW, float(I_applied), V_oc
 
-        # ========
-        # DA availability + tomorrow curve
-        # ========
-    
-    def _da_available_now(self, idx:int) -> bool:
+    # ========
+    # DA availability + tomorrow curve
+    # ========
+
+    # check if Day Ahead (DA) prices are published
+    def _da_available_now(self, idx: int) -> bool:
         return self.trade_ts[idx] >= self.da_publish_ts[idx]
 
-    def _get_tomorrow_da_curve(self) -> np.ndarray:
-        # At trade day D, the DA curve corresponds to delivery day D+1,
-        # and it lives in the current trade day's rows.
-        idxs = self.current_day_idxs
+    # Retrieve DA prices for all 48 sp
+    def _get_da_curve_for_delivery_day(self, delivery_day: np.datetime64) -> np.ndarray:
+        idxs = self.day_indices[delivery_day]
         return self.da_price[idxs].astype(np.float32)
 
+    def _get_tomorrow_da_curve(self) -> np.ndarray:
+        pos = self.day_pos[self.current_day]
+        if pos + 1 >= len(self.valid_days):
+            return np.zeros(48, dtype=np.float32)
+        tomorrow_day = self.valid_days[pos + 1]
+        return self._get_da_curve_for_delivery_day(tomorrow_day)
+    
+    # Retrieve Observation
     def _get_obs(self) -> np.ndarray:
-        idx = int(self.current_day_idxs[self.slot0])
+        idx = int(self.current_day_idxs[self.slot0]) # row index of current settlement period
 
-        now_ts = self.trade_ts[idx]
-        tau_now = float(self.tau[idx])  # 1..48
+        tau0 = int(self.tau[idx]) - 1
+        planned_idx = int(self.today_plan[tau0]) # convert plan index to Power
+        planned_power_now = float(self.power_levels[planned_idx]) if planned_idx >= 0 else 0.0
 
-        da_avail = 1.0 if self._da_available_now(idx) else 0.0
-        tomorrow_curve = self._get_tomorrow_da_curve() if da_avail else np.zeros(48, dtype=np.float32)
+        tau_now = float(self.tau[idx])
+        da_avail = 1.0 if self._da_available_now(idx) else 0.0 # 1 if DA can be used for planningn right now
+        
+        #only reveal tommorrow's DA curve if DA is published and tommorrow exists in database
+        pos = self.day_pos[self.current_day]
+        tomorrow_exists = (pos + 1) < len(self.valid_days)
+        tomorrow_curve = self._get_tomorrow_da_curve() if (da_avail == 1.0 and tomorrow_exists) else np.zeros(48, dtype=np.float32)
 
+        # observation = main state + optional tommorrow curve 
         main = np.array(
-            [
-                float(self.soc),
-                float(self.spot_price[idx]),
-                float(self.ci[idx]),
-                tau_now,
-                float(self.p_prev),
-                da_avail,
-            ],
+            [self.soc, self.id_price[idx], self.ci[idx], tau_now, self.p_prev, da_avail, planned_power_now],
             dtype=np.float32,
         )
         return np.concatenate([main, tomorrow_curve], axis=0)
@@ -353,56 +366,69 @@ class BatteryEnv(Env):
     # GYM API
     # =========
     def step(self, action):
-        
+        # actions
         dispatch_idx = int(action[0])
-        plan_idx = int(action[1])
+        plan_idx     = int(action[1])
+        plan_slot    = int(action[2])
 
-        if not (0 <= dispatch_idx < self.n_power_levels):
-            raise ValueError("dispatch_idx out of range")
-        if not (0 <= plan_idx < self.n_power_levels):
-            raise ValueError("plan_idx out of range")
-
-        # Current row
+        # --- current row first ---
         idx = int(self.current_day_idxs[self.slot0])
-        now_ts = self.trade_ts[idx]
+        now_ts = self.trade_ts[idx] # 1..48
         tau0 = int(self.tau[idx]) - 1  # 0..47
 
-        # Choose executed dispatch
-        planned_idx = int(self.today_plan[tau0])
-        dispatch_idx_eff = planned_idx if planned_idx >= 0 else int(action[0])
+        # --- availability / tomorrow existence ---
+        da_avail = self._da_available_now(idx)
+        pos = self.day_pos[self.current_day]
+        tomorrow_exists = (pos + 1) < len(self.valid_days)
 
-        # DISPATCH NOW (use dispatch_idx_eff)
+        # --- planned index for this delivery slot ---
+        planned_idx = int(self.today_plan[tau0])
+
+        # --- execute dispatch (agent can deviate) ---
+        dispatch_idx_eff = dispatch_idx
         P_req_MW = float(self.power_levels[dispatch_idx_eff])
         P_applied_MW, I_applied, V_oc_pack = self._apply_soc_protection(P_req_MW, self.soc)
 
+        # --- SoC update ---
         if I_applied < 0.0:
             delta_soc = -(I_applied * self.dt_seconds / self.Q_pack_C) * self.eta_ch
         elif I_applied > 0.0:
             delta_soc = -(I_applied * self.dt_seconds / self.Q_pack_C) / self.eta_dis
         else:
             delta_soc = 0.0
-
         self.soc = float(self.soc + delta_soc)
 
-        # Reward (spot/settlement at current time)
-        price_now = float(self.spot_price[idx])
-        ci_now = float(self.ci[idx])
+        # --- planned vs actual power (for reward split) ---
+        P_plan_MW = float(self.power_levels[planned_idx]) if planned_idx >= 0 else 0.0
+        P_act_MW  = float(P_applied_MW)
+        P_dev_MW  = P_act_MW - P_plan_MW #deviations of agent from initial plan
 
-        E_MWh = P_applied_MW * self.dt_hours
-        profit = E_MWh * price_now
+        da_price_now = float(self.da_price[idx])
+        id_price_now = float(self.id_price[idx])
+        ci_now       = float(self.ci[idx])
 
-        E_import_kWh = max(-E_MWh, 0.0) * 1000.0
-        E_export_kWh = max(E_MWh, 0.0) * 1000.0
+        # --- DA + ID revenue ---
+        # energy
+        E_plan_MWh = P_plan_MW * self.dt_hours
+        E_dev_MWh  = P_dev_MW  * self.dt_hours
+
+        R_DA = E_plan_MWh * da_price_now # revenue from planned action
+        R_ID = E_dev_MWh  * id_price_now # revenue from deviation action
+
+        # --- carbon penalty on actual ---
+        E_act_MWh = P_act_MW * self.dt_hours
+        E_import_kWh = max(-E_act_MWh, 0.0) * 1000.0
+        E_export_kWh = max(E_act_MWh, 0.0) * 1000.0
         carbon_penalty = self.lambda_ci * (E_import_kWh - E_export_kWh) * ci_now
 
+        profit = R_DA + R_ID
         reward = profit - carbon_penalty
 
         self.p_prev = float(P_applied_MW)
 
-        # 2) UPDATE TOMORROW PLAN (only if DA published)
-        da_avail = self._da_available_now(idx)
-        if da_avail:
-            self.tomorrow_plan[tau0] = int(plan_idx)   # plan_idx is action[1]
+        # --- update tomorrow plan (only after publish + tomorrow exists) ---
+        if da_avail and tomorrow_exists:
+            self.tomorrow_plan[plan_slot] = int(plan_idx)
 
         # 3) ADVANCE TIME
         ok = self._advance_one_slot()
@@ -417,17 +443,22 @@ class BatteryEnv(Env):
             "trade_date": str(pd.Timestamp(self.trade_date[idx])),
             "delivery_date": str(pd.Timestamp(self.delivery_date[idx])),
             "tau": int(tau0 + 1),
+            "decision_ts": str(pd.Timestamp(self.trade_ts[idx])),
+		    "delivery_ts": str(pd.Timestamp(self.delivery_ts[idx])),
 
             "dispatch_idx_exec": int(dispatch_idx_eff),
             "dispatch_idx_agent": int(action[0]),
             "plan_idx_agent": int(action[1]),
             "planned_idx_today" : int(planned_idx),
+            "plan_slot_agent": int(plan_slot),
+            "tomorrow_plan_value_written": int(self.tomorrow_plan[plan_slot]) if da_avail else -999,
 
             "P_req_MW": float(P_req_MW),
             "P_applied_MW": float(P_applied_MW),
             "delta_soc": float(delta_soc),
 
-            "price_now": float(price_now),
+            "id_price_now": float(id_price_now),
+            "da_price_now": float(da_price_now),
             "ci_now": float(ci_now),
             "profit": float(profit),
             "carbon_penalty": float(carbon_penalty),
