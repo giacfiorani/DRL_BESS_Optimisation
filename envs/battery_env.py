@@ -10,23 +10,25 @@ from pathlib import Path
 class BatteryEnv(Env):
 
     """
-    Overlap (realistic) environment:
-      - 1 step = 1 half-hour in real time.
-      - Every step: dispatch now (SoC + reward).
-      - Also every step: optionally update tomorrow's DA plan at the same tau,
-        but ONLY after publish time.
+    BatteryEnv — Day-Ahead Planning + Intraday Rebalancing Environment
 
-    Observation includes:
-      - current spot/settlement price (proxy = price_gbp_mwh)
-      - SoC, tau, previous power
-      - DA availability flag
-      - tomorrow DA curve (48 prices) visible only after publish time (else zeros)
+    This environment models a grid-scale battery operating in the UK power market
+    with two market layers:
 
-    Action:
-      - MultiDiscrete [dispatch_now_idx, plan_tomorrow_idx, plan_slot]
-        dispatch_now_idx: applied immediately (real-time dispatch)
-        plan_tomorrow_idx: power-level index to write into tomorrow_plan
-        plan_slot: slot index (0..47) of tomorrow_plan to write; only if DA is available
+    • Day-Ahead (DA): a forward commitment schedule for the next delivery day,
+    published on trade day D-1 after a fixed publish time.
+    • Intraday (ID / MID): a short-term market used to rebalance deviations
+    during the actual delivery day.
+
+    The agent:
+    • builds a DA commitment for tomorrow once the DA curve is published,
+    • executes real-time dispatch during delivery,
+    • earns DA revenue on committed energy,
+    • earns/pays MID revenue on deviations from the DA plan,
+    • is physically constrained by battery SoC via a safety shield.
+
+    Time resolution: 30-minute settlement periods (UK SPs).
+    One environment step = one delivery half-hour.
     """
     
     metadata = {"render_modes": []}
@@ -98,6 +100,9 @@ class BatteryEnv(Env):
         # ========
         # 2. LOAD DATA
         # ========
+        # trade_ts: time at which DA information becomes available (trade day D-1)
+        # delivery_ts: physical electricity delivery half-hour (delivery day D)
+        # The agent steps forward in delivery_ts, not trade_ts
 
         ROOT_DIR = Path(__file__).resolve().parents[1]
         DATA_PATH = ROOT_DIR / "data" / "training_data.parquet"
@@ -111,7 +116,9 @@ class BatteryEnv(Env):
         #index on delivery timestamp 
         df = df.sort_values("delivery_ts").reset_index(drop=True)
 
-        # DA publish time is on the TRADE day at publish_hour
+        # DA publish timestamp:
+        # DA prices for delivery day D become available on trade day D-1
+        # at a fixed publish hour (e.g. 12:00).
         df["da_publish_ts"] = df["trade_date"] + pd.Timedelta(hours=self.publish_hour)
 
         self.df = df
@@ -128,7 +135,10 @@ class BatteryEnv(Env):
         self.ci = df["carbon_gco2_kwh"].to_numpy(dtype=np.float32) # carbon intensity data
 
         #====
-        # Build trade_date -> indices mapping (keep complete 48-slot trade days)
+        # Group environment episodes by DELIVERY day (not trade day):
+        # • DA commitments apply to an entire delivery day (48 SPs)
+        # • MID prices and carbon intensity are realised at delivery time
+        # • Each episode day = one physical delivery day
         #===
         day_to_idx = df.groupby("delivery_date").indices
         valid_days = []
@@ -169,11 +179,24 @@ class BatteryEnv(Env):
         # ========
         # 3) ACTION SPACE
         # ========
+        # Action space:
+        # [dispatch_idx, plan_idx, plan_slot]
+        #
+        # dispatch_idx:
+        #   Real-time physical dispatch request for the current delivery SP.
+        #
+        # plan_idx:
+        #   Power level to commit in the DA plan for a future delivery day.
+        #
+        # plan_slot:
+        #   Target settlement period (0..47) of tomorrow's DA plan to update.
+        #
+        # This allows the agent to gradually construct a full 48-slot DA schedule
+        # after the DA curve is published, while still dispatching in real time.
+
         self.power_levels = np.linspace(-self.P_max_MW, self.P_max_MW, self.n_power_levels).astype(np.float32)
+        
         # MultiDiscrete action: [dispatch_idx, plan_idx, plan_slot]
-        # - dispatch_idx: real-time dispatch action for the current slot 
-        # - plan_idx: DA plan action to write into tomorrow_plan for the same tau (if DA is published)
-        # - plan_slot (0..47): which slot of tomorrow_plan to write
         self.action_space = gym.spaces.MultiDiscrete([self.n_power_levels, self.n_power_levels, 48])
         
         # ========
@@ -241,7 +264,10 @@ class BatteryEnv(Env):
 
         I = (V_oc_pack - np.sqrt(discriminant)) / (2.0 * self.R_sys)
         return float(I)
-    
+    # Safety shield:
+    # Physical infeasible actions are clipped to SoC limits.
+    # This avoids explicit imbalance settlement (SBP/SSP) while ensuring
+    # the agent never violates battery constraints.
     def _apply_soc_protection(self, P_requested_MW: float, soc: float) -> tuple[float, float, float]:
         """
         Protection function: clamp power to prevent overcharging/overdischarging.
@@ -311,8 +337,17 @@ class BatteryEnv(Env):
         tomorrow_day = self.valid_days[pos + 1]
         return self._get_da_curve_for_delivery_day(tomorrow_day)
     
-    # Retrieve Observation
+    # Observation consists of:
+    # • current SoC
+    # • intraday (MID) price for this delivery half-hour
+    # • carbon intensity
+    # • settlement period index (tau)
+    # • previous applied power
+    # • DA availability flag
+    # • planned DA power for this slot (if any)
+    # • full DA price curve for tomorrow (48 values), visible only after publish
     def _get_obs(self) -> np.ndarray:
+
         idx = int(self.current_day_idxs[self.slot0]) # row index of current settlement period
 
         tau0 = int(self.tau[idx]) - 1
@@ -420,17 +455,38 @@ class BatteryEnv(Env):
         E_import_kWh = max(-E_act_MWh, 0.0) * 1000.0
         E_export_kWh = max(E_act_MWh, 0.0) * 1000.0
         carbon_penalty = self.lambda_ci * (E_import_kWh - E_export_kWh) * ci_now
-
         profit = R_DA + R_ID
+
+        # Reward decomposition (Plan + Adjust):
+        #
+        # • DA revenue:
+        #   Energy committed in the DA plan is settled at the DA price.
+        #
+        # • ID revenue:
+        #   Any deviation between actual dispatch and DA plan is settled
+        #   at the intraday (MID) price.
+        #
+        # • Carbon penalty:
+        #   Applied to actual energy imported/exported, based on realised
+        #   carbon intensity.
+        #
+        # This mirrors a realistic DA commitment with intraday rebalancing,
+        # while physical infeasibility is prevented by SoC safety shielding.
         reward = profit - carbon_penalty
 
         self.p_prev = float(P_applied_MW)
 
-        # --- update tomorrow plan (only after publish + tomorrow exists) ---
+        # Tomorrow plan update:
+        # • The agent may update tomorrow's DA plan only after DA publish time.
+        # • The plan applies to the NEXT delivery day.
+        # • The current delivery day's plan is frozen and cannot be changed.
         if da_avail and tomorrow_exists:
             self.tomorrow_plan[plan_slot] = int(plan_idx)
 
         # 3) ADVANCE TIME
+        # At delivery-day rollover:
+        # • tomorrow_plan becomes today_plan (fixed DA commitment)
+        # • a fresh tomorrow_plan buffer is initialised
         ok = self._advance_one_slot()
 
         terminated = (self.days_done >= self.episode_days)
