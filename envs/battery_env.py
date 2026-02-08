@@ -2,10 +2,7 @@ import gymnasium as gym
 import pandas as pd
 import numpy as np
 from gymnasium import Env, spaces
-import env_config
 from pathlib import Path
-
-
 
 class BatteryEnv(Env):
 
@@ -35,7 +32,7 @@ class BatteryEnv(Env):
 
     def __init__(
         self,
-        env_config,
+        config, # if different configurations want to be included 
         publish_hour: int = 12,
         episode_days: int = 30,
         randomize_init_soc: bool = True,
@@ -58,44 +55,49 @@ class BatteryEnv(Env):
         # 1. HARDWARE & MDP PARAMETERS
         # ========
         # CATL EnerOne 1P416S
-        self.N_cells = env_config.N_cells
+        self.N_cells = config.N_cells
         # Pack charge (Coulombs): 280 Ah * 3600 s/h
-        self.Q_pack_C = env_config.Q_cell_C # 1,008,000 C - Since 1P416S Q_cell = Q_pack
-        self.V_nominal = env_config.V_nominal  # V
-        self.E_nominal = env_config.E_nominal  # kWh
+        self.Q_pack_C = config.Q_cell_C # 1,008,000 C - Since 1P416S Q_cell = Q_pack
+        self.V_nominal = config.V_nominal  # V
+        self.E_nominal = config.E_nominal  # kWh
 
         # Operational limits (from your MDP)
-        self.SoC_min = env_config.SoC_min
-        self.SoC_max = env_config.SoC_max
-        self.SoC_initial = float(env_config.SoC_initial)
+        self.SoC_min = config.SoC_min
+        self.SoC_max = config.SoC_max
+        self.SoC_initial = float(config.SoC_initial)
 
         # Time step: 30 minutes
-        self.dt_hours = env_config.dt
+        self.dt_hours = config.dt
         self.dt_seconds = self.dt_hours * 3600.0
 
         # Efficiencies (from your MDP)
-        self.eta_ch = env_config.eff_ch   # charge efficiency
-        self.eta_dis = env_config.eff_dis    # discharge efficiency
+        self.eta_ch = config.eff_ch   # charge efficiency
+        self.eta_dis = config.eff_dis    # discharge efficiency
 
         # Power / action scaling
-        self.P_max_MW = env_config.P_max_MW
-        self.n_power_levels = env_config.n_power_levels
+        self.P_max_MW = config.P_max_MW
+        self.n_power_levels = config.n_power_levels
 
         # Reward config: carbon weight λ
-        self.lambda_ci = float(env_config.lambda_ci)
+        self.lambda_ci = float(config.lambda_ci)
         
         # ECM R-int model parameter (internal resistance)
-        self. R_cell_mOhm = env_config.R_cell_mOhm  # mΩ per cell
+        self.R_cell_mOhm = config.R_cell_mOhm  # mΩ per cell
         self.R_sys = (self.R_cell_mOhm / 1000.0) * self.N_cells  # Ω (pack resistance)
 
         # Init SoC range defaults to your operational limits
         self.init_soc_low = float(self.SoC_min if init_soc_low is None else init_soc_low)
         self.init_soc_high = float(self.SoC_max if init_soc_high is None else init_soc_high)
 
+        #Scaling Factors for Profit and Carbon Penalty rewards
+        self.id_scale = config.S_mid_profit
+        self.da_scale = config.S_da_profit
+        self.ci_scale = config.S_carbon
+
         # ========
         # Read from OCV Lookup Table and Interpolate to get OCV-SOC Curve
         # ========
-        self.ocv_soc_points, self.ocv_cell_volts = env_config.ocv_lookup_table()
+        self.ocv_soc_points, self.ocv_cell_volts = config.ocv_lookup_table()
         
         # ========
         # 2. LOAD DATA
@@ -108,18 +110,13 @@ class BatteryEnv(Env):
         DATA_PATH = ROOT_DIR / "data" / "training_data.parquet"
         df = pd.read_parquet(DATA_PATH).copy()
 
-        df["trade_ts"] = pd.to_datetime(df["trade_ts"]) # Trade Day Timestamp
-        df["delivery_ts"] = pd.to_datetime(df["delivery_ts"])  # Delivery Day Timestamp
-        df["trade_date"] = pd.to_datetime(df["trade_date"])  # Trade day (auction day)
-        df["delivery_date"] = pd.to_datetime(df["delivery_date"])  # Delivery day for each row (the day electricity is delivered)
+        df["trade_ts"] = pd.to_datetime(df["trade_ts"])
+        df["delivery_ts"] = pd.to_datetime(df["delivery_ts"])
+        df["trade_date"] = pd.to_datetime(df["trade_date"])
+        df["delivery_date"] = pd.to_datetime(df["delivery_date"]).dt.floor("D")
 
-        #index on delivery timestamp 
+        # Index on delivery timestamp
         df = df.sort_values("delivery_ts").reset_index(drop=True)
-
-        # DA publish timestamp:
-        # DA prices for delivery day D become available on trade day D-1
-        # at a fixed publish hour (e.g. 12:00).
-        df["da_publish_ts"] = df["trade_date"] + pd.Timedelta(hours=self.publish_hour)
 
         self.df = df
 
@@ -127,8 +124,7 @@ class BatteryEnv(Env):
         self.trade_ts = df["trade_ts"].to_numpy(dtype="datetime64[ns]")
         self.delivery_ts = df["delivery_ts"].to_numpy(dtype="datetime64[ns]")
         self.trade_date = df["trade_date"].to_numpy(dtype="datetime64[ns]")
-        self.delivery_date = df["delivery_date"].to_numpy(dtype="datetime64[ns]")
-        self.da_publish_ts = df["da_publish_ts"].to_numpy(dtype="datetime64[ns]") 
+        self.delivery_date = df["delivery_date"].to_numpy(dtype="datetime64[ns]")       
         self.tau = df["tau"].to_numpy(dtype=np.int32)  # 1..48
         self.id_price = df["mid_price_gbp_mwh"].to_numpy(dtype=np.float32) # intraday prices data
         self.da_price = df["da_price_gbp_mwh"].to_numpy(dtype=np.float32) # day ahead prices data
@@ -203,17 +199,21 @@ class BatteryEnv(Env):
         # 4) OBSERVATION SPACE
         # ========
         # obs = [SoC, spot_price_now, CI_now, tau_now, P_prev, da_available] + tomorrow_DA_curve_48
-        low_main  = np.array([0.0, -300.0, 0.0, 1.0, -self.P_max_MW, 0.0, -self.P_max_MW], dtype=np.float32)
-        high_main = np.array([1.0, 2500.0, 1000.0, 48.0,  self.P_max_MW, 1.0,  self.P_max_MW], dtype=np.float32)
+        low_main  = np.array([0.0, -250.0, 0.0, 1.0, -self.P_max_MW, 0.0, -self.P_max_MW], dtype=np.float32)
+        high_main = np.array([1.0, 3000.0, 1000.0, 48.0,  self.P_max_MW, 1.0,  self.P_max_MW], dtype=np.float32)
 
         # these define the min/max limits for each of the 48 entries of the “tomorrow DA price curve” that are included in the observation.
-        low_curve = np.full((48,), -300.0, dtype=np.float32)
-        high_curve = np.full((48,), 2500.0, dtype=np.float32)
+        low_da_curve = np.full((48,), -250.0, dtype=np.float32)
+        high_da_curve = np.full((48,), 3000.0, dtype=np.float32)
 
-        # Total Obs length = 48 + 7 = 55 floats
+        # tomorrow CI curve bounds (gCO2/kWh)
+        low_ci_curve  = np.full((48,), 0.0, dtype=np.float32)
+        high_ci_curve = np.full((48,), 1000.0, dtype=np.float32)
+
+        # Total Obs length = 48 + 7 + 48 = 103 floats
         self.observation_space = gym.spaces.Box(
-            low=np.concatenate([low_main, low_curve]),
-            high=np.concatenate([high_main, high_curve]),
+            low=np.concatenate([low_main, low_da_curve, low_ci_curve]),
+            high=np.concatenate([high_main, high_da_curve, high_ci_curve]),
             dtype=np.float32,
         )
 
@@ -321,21 +321,51 @@ class BatteryEnv(Env):
     # DA availability + tomorrow curve
     # ========
 
+    def _publish_ts_for_delivery_day(self, delivery_day: np.datetime64) -> np.datetime64:
+        """
+        DA for a delivery day D is assumed published at (D-1) at publish_hour.
+        delivery_day is date at midnight (dtype datetime64[ns]).
+        """
+        d = pd.Timestamp(delivery_day).floor("D")
+        publish = (d - pd.Timedelta(days=1)) + pd.Timedelta(hours=self.publish_hour)
+        return np.datetime64(publish)
+
     # check if Day Ahead (DA) prices are published
     def _da_available_now(self, idx: int) -> bool:
-        return self.trade_ts[idx] >= self.da_publish_ts[idx]
+        """
+        At decision time = current delivery_ts, do we have tomorrow's DA curve?
+        DA for delivery day D is published at (D-1) publish_hour.
+        """
+        now = self.delivery_ts[idx]
+        tomorrow_day = self._get_tomorrow_day_from_delivery_ts(idx)
+        publish_ts = self._publish_ts_for_delivery_day(tomorrow_day)
+        return now >= publish_ts
 
     # Retrieve DA prices for all 48 sp
     def _get_da_curve_for_delivery_day(self, delivery_day: np.datetime64) -> np.ndarray:
         idxs = self.day_indices[delivery_day]
         return self.da_price[idxs].astype(np.float32)
 
-    def _get_tomorrow_da_curve(self) -> np.ndarray:
-        pos = self.day_pos[self.current_day]
-        if pos + 1 >= len(self.valid_days):
+    def _get_tomorrow_day_from_delivery_ts(self, idx: int) -> np.datetime64:
+        now = self.delivery_ts[idx]
+        return np.datetime64(pd.Timestamp(now).floor("D") + pd.Timedelta(days=1))
+
+    def _get_tomorrow_da_curve(self, idx: int) -> np.ndarray:
+        tomorrow_day = self._get_tomorrow_day_from_delivery_ts(idx)
+        if tomorrow_day not in self.day_indices:
             return np.zeros(48, dtype=np.float32)
-        tomorrow_day = self.valid_days[pos + 1]
         return self._get_da_curve_for_delivery_day(tomorrow_day)
+
+
+    def _get_ci_curve_for_delivery_day(self, delivery_day: np.datetime64) -> np.ndarray:
+        idxs = self.day_indices[delivery_day]
+        return self.ci[idxs].astype(np.float32)
+    
+    def _get_tomorrow_ci_curve(self, idx: int) -> np.ndarray:
+        tomorrow_day = self._get_tomorrow_day_from_delivery_ts(idx)
+        if tomorrow_day not in self.day_indices:
+            return np.zeros(48, dtype=np.float32)
+        return self._get_ci_curve_for_delivery_day(tomorrow_day)
     
     # Observation consists of:
     # • current SoC
@@ -356,18 +386,21 @@ class BatteryEnv(Env):
 
         tau_now = float(self.tau[idx])
         da_avail = 1.0 if self._da_available_now(idx) else 0.0 # 1 if DA can be used for planningn right now
-        
-        #only reveal tommorrow's DA curve if DA is published and tommorrow exists in database
-        pos = self.day_pos[self.current_day]
-        tomorrow_exists = (pos + 1) < len(self.valid_days)
-        tomorrow_curve = self._get_tomorrow_da_curve() if (da_avail == 1.0 and tomorrow_exists) else np.zeros(48, dtype=np.float32)
 
-        # observation = main state + optional tommorrow curve 
+        # tomorrow curves only visible after publish, and only if tomorrow exists
+        if da_avail == 1.0:
+            tomorrow_da = self._get_tomorrow_da_curve(idx)
+            tomorrow_ci = self._get_tomorrow_ci_curve(idx)   # optional
+        else:
+            tomorrow_da = np.zeros(48, dtype=np.float32)
+            tomorrow_ci = np.zeros(48, dtype=np.float32)
+
         main = np.array(
             [self.soc, self.id_price[idx], self.ci[idx], tau_now, self.p_prev, da_avail, planned_power_now],
             dtype=np.float32,
         )
-        return np.concatenate([main, tomorrow_curve], axis=0)
+
+        return np.concatenate([main, tomorrow_da, tomorrow_ci], axis=0)
 
     
     # -----------------
@@ -386,7 +419,7 @@ class BatteryEnv(Env):
         self.today_plan = self.tomorrow_plan.copy()
         self.tomorrow_plan[:] = -1 # reset tomorrow plan buffer
 
-        # advance to next trade day in dataset
+        # advance to next delivery day in dataset
         pos = self.day_pos[self.current_day]
         nxt_pos = pos + 1
         if nxt_pos >= len(self.valid_days):
@@ -408,13 +441,13 @@ class BatteryEnv(Env):
 
         # --- current row first ---
         idx = int(self.current_day_idxs[self.slot0])
-        now_ts = self.trade_ts[idx] # 1..48
+        decision_ts = self.delivery_ts[idx] # 1..48
         tau0 = int(self.tau[idx]) - 1  # 0..47
 
         # --- availability / tomorrow existence ---
         da_avail = self._da_available_now(idx)
-        pos = self.day_pos[self.current_day]
-        tomorrow_exists = (pos + 1) < len(self.valid_days)
+        tomorrow_day = self._get_tomorrow_day_from_delivery_ts(idx)
+        tomorrow_exists = tomorrow_day in self.day_indices
 
         # --- planned index for this delivery slot ---
         planned_idx = int(self.today_plan[tau0])
@@ -447,6 +480,7 @@ class BatteryEnv(Env):
         E_plan_MWh = P_plan_MW * self.dt_hours
         E_dev_MWh  = P_dev_MW  * self.dt_hours
 
+        #Raw - non-normalised profits
         R_DA = E_plan_MWh * da_price_now # revenue from planned action
         R_ID = E_dev_MWh  * id_price_now # revenue from deviation action
 
@@ -454,8 +488,15 @@ class BatteryEnv(Env):
         E_act_MWh = P_act_MW * self.dt_hours
         E_import_kWh = max(-E_act_MWh, 0.0) * 1000.0
         E_export_kWh = max(E_act_MWh, 0.0) * 1000.0
-        carbon_penalty = self.lambda_ci * (E_import_kWh - E_export_kWh) * ci_now
-        profit = R_DA + R_ID
+        carbon_penalty = self.lambda_ci * (E_import_kWh - E_export_kWh) * ci_now / 1000 #transform from g -> kg
+
+
+        # -- Normalising profit and carbon penalty values - using tanh activation function & scaling
+        R_DA_norm = np.tanh(R_DA / self.da_scale)
+        R_ID_norm = np.tanh(R_ID / self.id_scale)
+        carbon_penalty_norm = np.tanh(carbon_penalty / self.ci_scale)
+
+        profit_norm = R_DA_norm + R_ID_norm
 
         # Reward decomposition (Plan + Adjust):
         #
@@ -472,7 +513,7 @@ class BatteryEnv(Env):
         #
         # This mirrors a realistic DA commitment with intraday rebalancing,
         # while physical infeasibility is prevented by SoC safety shielding.
-        reward = profit - carbon_penalty
+        reward = profit_norm - carbon_penalty_norm
 
         self.p_prev = float(P_applied_MW)
 
@@ -495,12 +536,12 @@ class BatteryEnv(Env):
         obs = self._get_obs()
 
         info = {
-            "trade_ts": str(pd.Timestamp(now_ts)),
             "trade_date": str(pd.Timestamp(self.trade_date[idx])),
             "delivery_date": str(pd.Timestamp(self.delivery_date[idx])),
             "tau": int(tau0 + 1),
-            "decision_ts": str(pd.Timestamp(self.trade_ts[idx])),
-		    "delivery_ts": str(pd.Timestamp(self.delivery_ts[idx])),
+            "decision_ts": str(pd.Timestamp(decision_ts)),
+            "delivery_ts": str(pd.Timestamp(self.delivery_ts[idx])),
+		    "trade_ts": str(pd.Timestamp(self.trade_ts[idx])),
 
             "dispatch_idx_exec": int(dispatch_idx_eff),
             "dispatch_idx_agent": int(action[0]),
@@ -516,8 +557,8 @@ class BatteryEnv(Env):
             "id_price_now": float(id_price_now),
             "da_price_now": float(da_price_now),
             "ci_now": float(ci_now),
-            "profit": float(profit),
-            "carbon_penalty": float(carbon_penalty),
+            "profit_norm": float(profit_norm),
+            "carbon_penalty_norm": float(carbon_penalty_norm),
 
             "da_available": bool(da_avail),
             "days_done": int(self.days_done),
@@ -569,3 +610,4 @@ class BatteryEnv(Env):
             "init_soc": float(self.soc),
         }
         return obs, info
+    

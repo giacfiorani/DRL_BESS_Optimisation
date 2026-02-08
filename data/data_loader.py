@@ -3,9 +3,11 @@ import os, time, datetime as dt
 from typing import Any, Dict, List, Optional, Sequence
 import requests
 import pandas as pd
+import time
 import eikon as ek
 import configparser as cp
 from eikon_rics_lists import DA_HH_RICS, SSP_RICS #import rics list for Wholesale prices 
+from pathlib import Path
 
 # all data date timezones are already in UTC 
 
@@ -42,23 +44,27 @@ def fetch_48sp_curve(
     if len(rics) != 48:
         raise ValueError(f"{curve_name}: expected 48 RICs, got {len(rics)}")
 
+
     cfg = cp.ConfigParser()
-    cfg.read("eikon.cfg")
-    ek.set_app_key(cfg["eikon"]["app_id"])
+    CFG_PATH = Path(__file__).resolve().parent / "eikon.cfg"   # data/eikon.cfg
+    cfg.read(CFG_PATH)
+
+    if "eikon" not in cfg or "app_id" not in cfg["eikon"] or not cfg["eikon"]["app_id"].strip():
+        raise RuntimeError(f"Missing eikon app_id in {CFG_PATH}")
+
+    ek.set_app_key(cfg["eikon"]["app_id"].strip())
+    print("Loaded Eikon cfg:", CFG_PATH)
 
     parts = [] # fetch each SP seperatly 
 
-    #loop through the 48 rics and align it to its settlement period (sp) number
+    # Loop through the 48 RICs (each RIC = one half-hour slot)
     for sp, ric in enumerate(rics, start=1):
-        #dataframe indexed by date
         ts = ek.get_timeseries(
             rics=ric,
             start_date=start_date,
             end_date=end_date,
             fields=[field],
         )
-        if ts is None or len(ts) == 0:
-            raise RuntimeError(f"Eikon returned no data for {ric} in [{start_date}, {end_date}]")
 
         ts = ts.sort_index() #ensures dataframe dates are stored ascending
 
@@ -137,7 +143,6 @@ def _get_json(url: str, params: Dict[str, Any], timeout: int = 30, max_retries: 
             return None
         r.raise_for_status()
     raise RuntimeError(f"Max retries exceeded for {url} with params={params}")
-
 
 def sp_to_halfhour_start(settlement_date: str, sp: int, tz: str = "Europe/London") -> pd.Timestamp:
     """
@@ -277,15 +282,12 @@ def fetch_market_index_range_by_settlement_date(
     #stack all days
     return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
 
-
-
 #=========
 # ----- CARBON INTENSITY DATA -----
 #=======
 
 URL = "https://api.neso.energy/api/3/action/datastore_search_sql"
 RESOURCE_ID = "f93d1835-75bc-43e5-84ad-12472b180a98"  # Carbon intensity dataset ID
-
 
 def fetch_carbon_sql(start_date: str, end_date: str) -> pd.DataFrame:
     """

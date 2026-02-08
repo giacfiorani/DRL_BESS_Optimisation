@@ -16,6 +16,12 @@ mid_df = fetch_market_index_range_by_settlement_date(
     data_providers=["APXMIDP"],
 )
 
+# Ensure no duplicates
+mid_df = mid_df.sort_values("timestamp").drop_duplicates(subset=["timestamp"], keep="last")
+ssp_df = ssp_df.sort_values("timestamp").drop_duplicates(subset=["timestamp"], keep="last")
+sbp_df = sbp_df.sort_values("timestamp").drop_duplicates(subset=["timestamp"], keep="last")
+carbon_df = carbon_df.sort_values("timestamp").drop_duplicates(subset=["timestamp"], keep="last")
+
 # ---------- 1) Clean timestamps ----------
 def clean_ts(df: pd.DataFrame, ts_col: str = "timestamp") -> pd.DataFrame:
     df = df.copy()
@@ -73,14 +79,23 @@ ssp_df    = ssp_df[["timestamp", "ssp_gbp_mwh"]]
 sbp_df    = sbp_df[["timestamp", "sbp_gbp_mwh"]]
 mid_df    = mid_df[["timestamp", "mid_price_gbp_mwh", "settlementDate", "settlementPeriod", "dataProvider"]]
 
-# ---------- 4) Merge (timestamp must be DELIVERY half-hour across all) ----------
+# ---------- 4) Merge: use DA as base (48 half-hours per day), left-join others ----------
+# Inner join drops any timestamp missing in one source, often leaving only one full day.
+# Left from DA keeps all DA timestamps; fill missing from others so we keep all days.
 merged_df = (
     da_df
-    .merge(mid_df[["timestamp", "mid_price_gbp_mwh"]], on="timestamp", how="inner")
-    .merge(ssp_df, on="timestamp", how="inner")
-    .merge(sbp_df, on="timestamp", how="inner")
-    .merge(carbon_df, on="timestamp", how="inner")
+    .merge(mid_df[["timestamp", "mid_price_gbp_mwh"]], on="timestamp", how="left")
+    .merge(ssp_df, on="timestamp", how="left")
+    .merge(sbp_df, on="timestamp", how="left")
+    .merge(carbon_df, on="timestamp", how="left")
 ).sort_values("timestamp").reset_index(drop=True)
+
+# Forward-fill then back-fill missing prices/carbon (e.g. sparse carbon or MID)
+for col in ["mid_price_gbp_mwh", "ssp_gbp_mwh", "sbp_gbp_mwh", "carbon_gco2_kwh"]:
+    merged_df[col] = merged_df[col].ffill().bfill()
+
+# Drop any rows that still have NaN (e.g. leading/lagging edges)
+merged_df = merged_df.dropna(subset=["mid_price_gbp_mwh", "carbon_gco2_kwh"]).reset_index(drop=True)
 
 # ---------- 5) Canonical time columns (delivery_ts == timestamp) ----------
 merged_df["delivery_ts"] = merged_df["timestamp"]
@@ -110,7 +125,14 @@ cols = [
     "carbon_gco2_kwh",
 ]
 merged_df = merged_df[cols].sort_values(["delivery_ts"]).reset_index(drop=True)
+merged_df = merged_df.drop_duplicates(subset=["delivery_date", "tau"], keep="first")
+
+# ---------- 5) Optional audit ----------
+RUN_AUDIT = False
+if RUN_AUDIT:
+    audit_alignment(mid_df, carbon_df)
 
 merged_df.to_parquet("data/training_data.parquet", index=False)
-print("Saved:", len(merged_df), "rows")
+n_days = merged_df["delivery_ts"].dt.floor("D").nunique()
+print("Saved:", len(merged_df), "rows,", n_days, "unique delivery days")
 print("Range delivery:", merged_df["delivery_ts"].min(), "→", merged_df["delivery_ts"].max())

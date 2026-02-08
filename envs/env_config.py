@@ -1,4 +1,14 @@
 import numpy as np
+from pathlib import Path
+import pandas as pd
+import reward_scaling
+
+# ====
+# Load Whole dataset dataframe
+# === 
+ROOT_DIR = Path(__file__).resolve().parents[1] if "__file__" in globals() else Path.cwd().parents[0]
+DATA_PATH = ROOT_DIR / "data" / "training_data.parquet"
+df = pd.read_parquet(DATA_PATH).copy()
 
 # ========
 # BESS HARDWARE SPECIFICATIONS (CATL EnerOne, Liquid-Cooled Rack)
@@ -40,6 +50,11 @@ lambda_ci = 0.9  # Carbon penalty weight (λ) - tunable scalar
 
 # For discrete action space, we need to define the number of power levels
 n_power_levels = 11
+
+#reward scaling values
+S_carbon= reward_scaling.S_carbon
+S_da_profit = reward_scaling.S_da_profit
+S_mid_profit = reward_scaling.S_mid_profit
 
 # ========
 # OCV LOOKUP TABLE (The DC OCV-SOC Curve from Spec Sheet @25°C)
