@@ -551,6 +551,8 @@ class BatteryEnv(Env):
             "tomorrow_plan_value_written": int(self.tomorrow_plan[plan_slot]) if da_avail else -999,
 
             "P_req_MW": float(P_req_MW),
+            "P_planned_MW" : float(P_plan_MW),
+            "P_dev_MW" : float(P_dev_MW),
             "P_applied_MW": float(P_applied_MW),
             "delta_soc": float(delta_soc),
 
