@@ -559,6 +559,8 @@ class BatteryEnv(Env):
             "id_price_now": float(id_price_now),
             "da_price_now": float(da_price_now),
             "ci_now": float(ci_now),
+            "Planned_Profit": float(R_DA_norm),
+            "Intraday_Profit": float(R_ID_norm),
             "profit_norm": float(profit_norm),
             "carbon_penalty_norm": float(carbon_penalty_norm),
 
