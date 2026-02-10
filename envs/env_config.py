@@ -1,4 +1,14 @@
 import numpy as np
+from pathlib import Path
+import pandas as pd
+import reward_scaling
+
+# ====
+# Load Whole dataset dataframe
+# === 
+ROOT_DIR = Path(__file__).resolve().parents[1] if "__file__" in globals() else Path.cwd().parents[0]
+DATA_PATH = ROOT_DIR / "data" / "training_data.parquet"
+df = pd.read_parquet(DATA_PATH).copy()
 
 # ========
 # BESS HARDWARE SPECIFICATIONS (CATL EnerOne, Liquid-Cooled Rack)
@@ -9,6 +19,8 @@ Q_cell_C = 280 * 3600  # C (Coulombs) for Coulomb counting: Q = 280 Ah × 3600 s
 V_nominal = 1331.2  # V (nominal pack voltage)
 E_nominal = 372.7  # kWh (nominal energy)
 E_max = 0.3727  # MWh (same as E_nominal, converted to MWh)
+R_cell_mOhm = 0.4 # mΩ per cell (from Product Specification Sheet)
+
 
 # ========
 # OPERATIONAL PARAMETERS
@@ -21,7 +33,7 @@ SoC_initial = 0.5  # Initial SoC (fraction) - set to mid-range for safety
 # EFFICIENCY PARAMETERS
 # ========
 eff_dis = 1.0  # Discharge efficiency (η_discharge = 1 per MDP)
-eff_ch = 0.99  # Charge efficiency (η_charge = 0.995 per MDP)
+eff_ch = 0.99  # Charge efficiency (η_charge = 0.99)
 self_dis = 0.0  # Self-discharge rate per timestep (set to 0 for simplicity)
 
 # ========
@@ -39,7 +51,10 @@ lambda_ci = 0.9  # Carbon penalty weight (λ) - tunable scalar
 # For discrete action space, we need to define the number of power levels
 n_power_levels = 11
 
-ocv_table_size = 101 # 1001 points for 0.001 resolution
+#reward scaling values
+S_carbon= reward_scaling.S_carbon
+S_da_profit = reward_scaling.S_da_profit
+S_mid_profit = reward_scaling.S_mid_profit
 
 # ========
 # OCV LOOKUP TABLE (The DC OCV-SOC Curve from Spec Sheet @25°C)
