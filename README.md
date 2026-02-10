@@ -167,8 +167,10 @@ R_ID = (E_act − E_plan) × p_ID
 **Carbon penalty**
 C = λ × (E_import − E_export) × CI
 
-Carbon intensity is expressed in **gCO₂/kWh**.  
+Carbon intensity is expressed in **gCO₂/kWh**. 
+Carbon Penalty is expressed in **kgCO₂/kWh**
 Discharging during high-CI periods is rewarded as it offsets fossil generation.
+Future work will use MEF values to expresss true offsetted carbon emissions from discharging rather than using CI.
 
 ---
 
@@ -183,6 +185,8 @@ To stabilise DRL training, rewards are **bounded and scaled**:
 
 - Normalisation uses a **tanh activation**:
 x_norm = tanh(x / S)
+
+Where S is the scaling constant and x is the variable.
 
 ### Final reward
 
@@ -225,7 +229,7 @@ The environment supports:
 ## Planned Extensions
 
 - Baseline heuristic policies
-- Degradation or cycling cost proxy
+- Degradation costs
 - Terminal SoC shaping
 - Deterministic optimisation benchmarks
 - Hierarchical or multi-day planning architectures
