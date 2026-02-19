@@ -6,7 +6,7 @@ import pandas as pd
 import time
 import eikon as ek
 import configparser as cp
-from eikon_rics_lists import DA_HH_RICS, SSP_RICS #import rics list for Wholesale prices 
+from eikon_rics_lists import DA_HH_RICS #import rics list for Wholesale prices 
 from pathlib import Path
 
 # all data date timezones are already in UTC 
@@ -18,14 +18,13 @@ from pathlib import Path
 ##
 # -- EIKON CONNECTION ---
 # Day Ahead Prices from Refinitiv Workspace
-# System Buy and Sell Prices (SSP & SBP)
 # ===
 def fetch_48sp_curve(
     start_date: str,
     end_date: str,
     rics: list[str],
     *,
-    curve_name: str,          # e.g. "DA", "SSP", "SBP"
+    curve_name: str,          # "DA"
     field: str = "CLOSE",
     tz_naive: bool = True,
 ) -> pd.DataFrame:
@@ -283,8 +282,86 @@ def fetch_market_index_range_by_settlement_date(
     return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
 
 #=========
-# ----- CARBON INTENSITY DATA -----
+# ----- CARBON INTENSITY DATA - ACTUAL AND FORECASTED-----
 #=======
+
+NESO_CKAN_BASE = "https://api.neso.energy/api/3/action"
+NATIONAL_CI_FORECAST_RESOURCE_ID = "0e5fde43-2de7-4fb4-833d-c7bca3b658b0"
+
+def fetch_ci_forecast(
+    start_date: str,
+    end_date: str,
+    *,
+    tz_naive: bool = True,
+    target_freq: str = "30min",
+) -> pd.DataFrame:
+    """
+    Fetch NESO national carbon intensity forecast table.
+
+    Columns in datastore: datetime, forecast, actual
+
+    Returns:
+      timestamp, ci_forecast_gco2_kwh, ci_actual_gco2_kwh
+    where:
+      - forecast = forecasted intensity (use for DA info / observation)
+      - actual   = realised intensity (use for realised penalty / labels)
+    """
+    url = f"{NESO_CKAN_BASE}/datastore_search"
+    start_ts = pd.Timestamp(f"{start_date}T00:00:00Z")
+    end_ts   = pd.Timestamp(f"{end_date}T00:00:00Z")
+
+    # paginate because multi-year pulls can exceed default limit
+    limit = 50000
+    offset = 0
+    records: list[dict] = []
+
+    while True:
+        params = {
+            "resource_id": NATIONAL_CI_FORECAST_RESOURCE_ID,
+            "limit": limit,
+            "offset": offset,
+        }
+        r = requests.get(url, params=params, timeout=60)
+        r.raise_for_status()
+        chunk = r.json()["result"]["records"]
+        if not chunk:
+            break
+        records.extend(chunk)
+        offset += limit
+
+        # safety: stop if we've clearly pulled everything
+        if len(chunk) < limit:
+            break
+
+    df = pd.DataFrame(records)
+    if df.empty:
+        return pd.DataFrame(columns=["timestamp", "ci_forecast_gco2_kwh"])
+
+    df.columns = [c.lower() for c in df.columns]
+    df["timestamp"] = pd.to_datetime(df["datetime"], utc=True, errors="coerce")
+
+    df["ci_forecast_gco2_kwh"] = pd.to_numeric(df["forecast"], errors="coerce")
+
+    df = df.dropna(subset=["timestamp"]).sort_values("timestamp")
+
+    # filter time window locally
+    df = df[(df["timestamp"] >= start_ts) & (df["timestamp"] < end_ts)]
+
+    out = df[["timestamp", "ci_forecast_gco2_kwh"]].copy()
+    out = out.drop_duplicates(subset=["timestamp"], keep="last").reset_index(drop=True)
+
+    # resample to 30min and forward fill (forecast often hourly)
+    out = (
+        out.set_index("timestamp")
+           .resample(target_freq)
+           .ffill()
+           .reset_index()
+    )
+
+    if tz_naive:
+        out["timestamp"] = out["timestamp"].dt.tz_convert(None)
+
+    return out
 
 URL = "https://api.neso.energy/api/3/action/datastore_search_sql"
 RESOURCE_ID = "f93d1835-75bc-43e5-84ad-12472b180a98"  # Carbon intensity dataset ID
@@ -292,7 +369,7 @@ RESOURCE_ID = "f93d1835-75bc-43e5-84ad-12472b180a98"  # Carbon intensity dataset
 def fetch_carbon_sql(start_date: str, end_date: str) -> pd.DataFrame:
     """
     Fetch carbon intensity rows where "from" is in [start_date, end_date),
-    returned as a tidy DataFrame with columns: timestamp, carbon_gco2_kwh.
+    returned as a tidy DataFrame with columns: timestamp, ci_actual_gco2_kwh.
     Dates are ISO strings: 'YYYY-MM-DD'.
     """
     sql = f"""
@@ -332,99 +409,228 @@ def fetch_carbon_sql(start_date: str, end_date: str) -> pd.DataFrame:
             raise KeyError(f"Can't find carbon intensity column in columns={df.columns.tolist()}")
 
     out = (df[["timestamp", ci_col]]
-           .rename(columns={ci_col: "carbon_gco2_kwh"})
+           .rename(columns={ci_col: "ci_actual_gco2_kwh"})
            .dropna(subset=["timestamp"])
            .sort_values("timestamp")
            .drop_duplicates("timestamp")
            .reset_index(drop=True))
     return out
 
-# ----- Demand Data - Actual Load ----- DONT KEEP FOR NOW
 
-# def fetch_demand_window(
-#     date_from: str,  # 'YYYY-MM-DD'
-#     date_to: str,    # 'YYYY-MM-DD' (exclusive end or same-day for <=7d)
-#     sp_from: Optional[int] = None,
-#     sp_to: Optional[int] = None,
-# ) -> pd.DataFrame:
-#     """
-#     Calls /demand/actual/total?from=YYYY-MM-DD&to=YYYY-MM-DD[&settlementPeriodFrom=..&settlementPeriodTo=..]
-#     The API supports a max window of 7 days per request.
-#     Returns columns: timestamp (datetime), settlementDate, settlementPeriod, demand_mw
-#     """
-#     url = f"{BASE}/demand/actual/total"
-#     params: Dict[str, Any] = {"from": date_from, "to": date_to, "format": "json"}
-#     if sp_from is not None:
-#         params["settlementPeriodFrom"] = sp_from
-#     if sp_to is not None:
-#         params["settlementPeriodTo"] = sp_to
+# ========
+# Carbon Future Price
+# Refinitiv data pull
+# ========
 
-#     r = requests.get(url, headers=_headers(), params=params, timeout=30)
-#     r.raise_for_status()
-#     payload = r.json()
+# 0#UKAFMc: | UKA Future | Intercontinental Exchange Europe | United Kingdom | GBP 
 
-#     data = payload.get("data", [])
-#     if not data:
-#         return pd.DataFrame(columns=["timestamp","settlementDate","settlementPeriod","demand_mw"])
+def fetch_uka_daily(start_date:str, end_date:str,  ric:str="UKAFMc1", field: str= "CLOSE", tz_naive: bool = True,) -> pd.DataFrame:
+    cfg = cp.ConfigParser()
+    CFG_PATH = Path(__file__).resolve().parent / "eikon.cfg"   # data/eikon.cfg
+    cfg.read(CFG_PATH)
 
-#     df = pd.DataFrame(data)
-#     # Normalise columns
-#     if "startTime" in df.columns:
-#         ts = pd.to_datetime(df["startTime"], errors="coerce")
-#     elif "timestamp" in df.columns:
-#         ts = pd.to_datetime(df["timestamp"], errors="coerce")
-#     else:
-#         raise KeyError(f"No time column in demand payload: {df.columns.tolist()}")
+    if "eikon" not in cfg or "app_id" not in cfg["eikon"] or not cfg["eikon"]["app_id"].strip():
+        raise RuntimeError(f"Missing eikon app_id in {CFG_PATH}")
 
-#     qty_col = "quantity" if "quantity" in df.columns else None
-#     if qty_col is None:
-#         # fall back to the first numeric column if schema changes
-#         nums = df.select_dtypes("number").columns.tolist()
-#         if not nums:
-#             raise KeyError("No numeric demand column found in demand payload")
-#         qty_col = nums[0]
+    ek.set_app_key(cfg["eikon"]["app_id"].strip())
+    print("Loaded Eikon cfg:", CFG_PATH)
 
-#     out = pd.DataFrame({
-#         "timestamp": ts,
-#         "settlementDate": df.get("settlementDate"),
-#         "settlementPeriod": df.get("settlementPeriod"),
-#         "demand_mw": pd.to_numeric(df[qty_col], errors="coerce"),
-#     }).dropna(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+    ts = ek.get_timeseries(
+            rics=ric,
+            start_date=start_date,
+            end_date=end_date,
+            fields=[field],
+        ).sort_index()
 
-#     return out
+    col = field if field in ts.columns else ts.columns[0]
+    df = ts[[col]].rename(columns={col: "uka_gbp_tco2"}).reset_index()
+    df = df.rename(columns={"Date": "timestamp"}) if "Date" in df.columns else df
+    df["timestamp"] = pd.to_datetime(df["timestamp"]).dt.normalize()
 
-# def fetch_demand_range(
-#     start_date: str,  # 'YYYY-MM-DD'
-#     end_date: str,    # 'YYYY-MM-DD' (inclusive end handled below)
-#     sp_from: Optional[int] = None,
-#     sp_to: Optional[int] = None,
-# ) -> pd.DataFrame:
-#     """
-#     Fetches demand for an arbitrarily long period by chunking into <=7-day windows.
-#     Returns tidy DataFrame with columns: timestamp, settlementDate, settlementPeriod, demand_mw
-#     """
-#     d0 = dt.date.fromisoformat(start_date)
-#     d1 = dt.date.fromisoformat(end_date)
-#     # Make d1 exclusive by adding 1 day when we form the final chunk bound
-#     end_excl = d1 + dt.timedelta(days=1)
+    if tz_naive:
+        df["timestamp"] = pd.to_datetime(df["timestamp"]).dt.tz_localize(None)
 
-#     frames: List[pd.DataFrame] = []
-#     chunk_start = d0
-#     while chunk_start < end_excl:
-#         chunk_end = min(chunk_start + dt.timedelta(days=7), end_excl)
-#         df_chunk = fetch_demand_window(
-#             chunk_start.isoformat(),
-#             chunk_end.isoformat(),
-#             sp_from=sp_from, sp_to=sp_to
-#         )
-#         if not df_chunk.empty:
-#             frames.append(df_chunk)
-#         chunk_start = chunk_end
+    return df[["timestamp", "uka_gbp_tco2"]]
 
-#     if not frames:
-#         return pd.DataFrame(columns=["timestamp","settlementDate","settlementPeriod","demand_mw"])
+# =====
+# ----- DEMAND DATA - ACTUAL LOAD 
+# =====
 
-#     df = pd.concat(frames, ignore_index=True)
-#     # De-duplicate just in case of overlapping edges
-#     df = df.drop_duplicates(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
-#     return df
+
+def fetch_demand_window(
+    date_from: str,  # 'YYYY-MM-DD'
+    date_to: str,    # 'YYYY-MM-DD' (exclusive end or same-day for <=7d)
+    sp_from: Optional[int] = None,
+    sp_to: Optional[int] = None,
+) -> pd.DataFrame:
+    """
+    Calls /demand/actual/total?from=YYYY-MM-DD&to=YYYY-MM-DD[&settlementPeriodFrom=..&settlementPeriodTo=..]
+    The API supports a max window of 7 days per request.
+    Returns columns: timestamp (datetime), settlementDate, settlementPeriod, demand_mw
+    """
+    url = f"{BASE}/demand/actual/total"
+    params: Dict[str, Any] = {"from": date_from, "to": date_to, "format": "json"}
+    if sp_from is not None:
+        params["settlementPeriodFrom"] = sp_from
+    if sp_to is not None:
+        params["settlementPeriodTo"] = sp_to
+
+    r = requests.get(url, headers=_headers(), params=params, timeout=30)
+    r.raise_for_status()
+    payload = r.json()
+
+    data = payload.get("data", [])
+    if not data:
+        return pd.DataFrame(columns=["timestamp","settlementDate","settlementPeriod","demand_mw"])
+
+    df = pd.DataFrame(data)
+    # Normalise columns
+    if "startTime" in df.columns:
+        ts = pd.to_datetime(df["startTime"], errors="coerce")
+    elif "timestamp" in df.columns:
+        ts = pd.to_datetime(df["timestamp"], errors="coerce")
+    else:
+        raise KeyError(f"No time column in demand payload: {df.columns.tolist()}")
+
+    qty_col = "quantity" if "quantity" in df.columns else None
+    if qty_col is None:
+        # fall back to the first numeric column if schema changes
+        nums = df.select_dtypes("number").columns.tolist()
+        if not nums:
+            raise KeyError("No numeric demand column found in demand payload")
+        qty_col = nums[0]
+
+    out = pd.DataFrame({
+        "timestamp": ts,
+        "settlementDate": df.get("settlementDate"),
+        "settlementPeriod": df.get("settlementPeriod"),
+        "demand_mw": pd.to_numeric(df[qty_col], errors="coerce"),
+    }).dropna(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+
+    return out
+
+def fetch_demand_range(
+    start_date: str,  # 'YYYY-MM-DD'
+    end_date: str,    # 'YYYY-MM-DD' (inclusive end handled below)
+    sp_from: Optional[int] = None,
+    sp_to: Optional[int] = None,
+) -> pd.DataFrame:
+    """
+    Fetches demand for an arbitrarily long period by chunking into <=7-day windows.
+    Returns tidy DataFrame with columns: timestamp, settlementDate, settlementPeriod, demand_mw
+    """
+    d0 = dt.date.fromisoformat(start_date)
+    d1 = dt.date.fromisoformat(end_date)
+    # Make d1 exclusive by adding 1 day when we form the final chunk bound
+    end_excl = d1 + dt.timedelta(days=1)
+
+    frames: List[pd.DataFrame] = []
+    chunk_start = d0
+    while chunk_start < end_excl:
+        chunk_end = min(chunk_start + dt.timedelta(days=7), end_excl)
+        df_chunk = fetch_demand_window(
+            chunk_start.isoformat(),
+            chunk_end.isoformat(),
+            sp_from=sp_from, sp_to=sp_to
+        )
+        if not df_chunk.empty:
+            frames.append(df_chunk)
+        chunk_start = chunk_end
+
+    if not frames:
+        return pd.DataFrame(columns=["timestamp","settlementDate","settlementPeriod","demand_mw"])
+
+    df = pd.concat(frames, ignore_index=True)
+    # De-duplicate just in case of overlapping edges
+    df = df.drop_duplicates(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+    return df
+
+# =====
+# MEF COMPUTATION (Model A proxy) — USING ELEXON BMRS datasets/FUELHH (historical)
+# =====
+
+import datetime as dt
+import time
+import requests
+import pandas as pd
+
+BMRS_DATASET_BASE = "https://data.elexon.co.uk/bmrs/api/v1/datasets"
+
+def fetch_fuelhh_range(start_date: str, end_date: str, sleep_s: float = 0.15) -> pd.DataFrame:
+    """
+    Historical FUELHH pull using settlementDateFrom/To (matches your curl example).
+    start_date inclusive, end_date exclusive. Both 'YYYY-MM-DD'.
+
+    Returns long df:
+      startTime (UTC tz-aware), settlementDate, settlementPeriod, fuelType, generation
+    """
+    url = f"{BMRS_DATASET_BASE}/FUELHH"
+
+    d0 = dt.date.fromisoformat(start_date)
+    d1 = dt.date.fromisoformat(end_date)
+
+    frames = []
+    d = d0
+    while d < d1:
+        params = {
+            "settlementDateFrom": d.isoformat(),
+            "settlementDateTo": (d + dt.timedelta(days=1)).isoformat(),
+            "format": "json",
+        }
+        r = requests.get(url, params=params, timeout=60)
+        r.raise_for_status()
+        rows = r.json().get("data", [])
+        if rows:
+            df = pd.DataFrame(rows)
+            df["startTime"] = pd.to_datetime(df["startTime"], utc=True, errors="coerce")
+            df = df[["startTime", "settlementDate", "settlementPeriod", "fuelType", "generation"]]
+            frames.append(df)
+
+        time.sleep(sleep_s)
+        d += dt.timedelta(days=1)
+
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(
+        columns=["startTime", "settlementDate", "settlementPeriod", "fuelType", "generation"]
+    )
+
+EF_TCO2_PER_MWH = {
+    "CCGT": 0.37,
+    "COAL": 0.82,
+    "OIL": 0.65,
+}
+
+def mef_proxy_highest_active(fuelhh: pd.DataFrame) -> pd.DataFrame:
+    wide = (
+        fuelhh.pivot_table(index="startTime", columns="fuelType", values="generation", aggfunc="sum")
+              .fillna(0.0)
+    )
+
+    active = {ft: (wide.get(ft, 0.0) > 0) for ft in EF_TCO2_PER_MWH.keys()}
+    fuels_by_ef = sorted(EF_TCO2_PER_MWH.items(), key=lambda x: x[1], reverse=True)
+
+    mef = pd.Series(0.0, index=wide.index)
+    for ft, ef in fuels_by_ef:
+        mef = mef.where(~active[ft], ef)
+
+    return mef.rename("mef_tco2_per_mwh").reset_index()
+
+def to_g_per_kwh(df_mef: pd.DataFrame) -> pd.DataFrame:
+    df = df_mef.copy()
+    df["mef_gco2_kwh"] = df["mef_tco2_per_mwh"] * 1000.0  # 1 t/MWh = 1000 g/kWh
+    return df[["startTime", "mef_gco2_kwh"]]
+
+def compute_mef_model_a(start_date: str, end_date: str, tz_naive: bool = True) -> pd.DataFrame:
+    fuelhh = fetch_fuelhh_range(start_date, end_date)
+    if fuelhh.empty:
+        return pd.DataFrame(columns=["timestamp", "mef_gco2_kwh"])
+
+    mef = mef_proxy_highest_active(fuelhh)
+    mef = to_g_per_kwh(mef)
+
+    out = mef.rename(columns={"startTime": "timestamp"}).copy()
+    out["timestamp"] = pd.to_datetime(out["timestamp"], utc=True, errors="coerce")
+
+    if tz_naive:
+        out["timestamp"] = out["timestamp"].dt.tz_convert(None)
+
+    return out.dropna(subset=["timestamp"]).sort_values("timestamp").drop_duplicates("timestamp", keep="last").reset_index(drop=True)

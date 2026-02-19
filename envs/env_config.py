@@ -25,7 +25,7 @@ R_cell_mOhm = 0.4 # mΩ per cell (from Product Specification Sheet)
 # ========
 # OPERATIONAL PARAMETERS
 # ========
-SoC_min = 0.2  # Minimum SoC (fraction)
+SoC_min = 0.1  # Minimum SoC (fraction)
 SoC_max = 0.9  # Maximum SoC (fraction)
 SoC_initial = 0.5  # Initial SoC (fraction) - set to mid-range for safety
 
@@ -52,9 +52,8 @@ lambda_ci = 0.9  # Carbon penalty weight (λ) - tunable scalar
 n_power_levels = 11
 
 #reward scaling values
-S_carbon= reward_scaling.S_carbon
-S_da_profit = reward_scaling.S_da_profit
-S_mid_profit = reward_scaling.S_mid_profit
+S_profit = reward_scaling.S_profit
+S_carbon_gbp= reward_scaling.S_carbon_gbp
 
 # ========
 # OCV LOOKUP TABLE (The DC OCV-SOC Curve from Spec Sheet @25°C)

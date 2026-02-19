@@ -1,138 +1,289 @@
+from __future__ import annotations
+
+from pathlib import Path
 import pandas as pd
-from data_loader import fetch_48sp_curve, fetch_carbon_sql, fetch_market_index_range_by_settlement_date
-from data_audit import audit_alignment
-from eikon_rics_lists import DA_HH_RICS, SSP_RICS, SBP_RICS
 
-start = "2021-01-01"
-end   = "2023-01-01"
+from data_loader import (
+    fetch_48sp_curve,
+    fetch_market_index_range_by_settlement_date,
+    fetch_uka_daily,
+    fetch_ci_forecast,
+    fetch_carbon_sql,
+    compute_mef_model_a,
+)
+from eikon_rics_lists import DA_HH_RICS
 
-carbon_df = fetch_carbon_sql(start, end)
-da_df  = fetch_48sp_curve(start, end, DA_HH_RICS, curve_name="DA")
-ssp_df = fetch_48sp_curve(start, end, SSP_RICS,   curve_name="SSP")
-sbp_df = fetch_48sp_curve(start, end, SBP_RICS,   curve_name="SBP")
+# -----------------------
+# Config
+# -----------------------
+START = "2022-01-01"
+END   = "2024-01-01"
+
+ROOT = Path(__file__).resolve().parents[1]
+OUT_PATH = ROOT / "data" / "training_data.parquet"
+
+# -----------------------
+# Helpers
+# -----------------------
+def clean_ts_utc_naive(df: pd.DataFrame, ts_col: str = "timestamp") -> pd.DataFrame:
+    """Parse timestamp to tz-naive UTC and sort."""
+    df = df.copy()
+    if ts_col not in df.columns:
+        raise KeyError(f"Expected column '{ts_col}' in df columns={df.columns.tolist()}")
+    df[ts_col] = pd.to_datetime(df[ts_col], utc=True, errors="coerce").dt.tz_convert(None)
+    df = df.dropna(subset=[ts_col]).sort_values(ts_col).reset_index(drop=True)
+    return df
+
+
+def dedup_last(df: pd.DataFrame, subset: list[str]) -> pd.DataFrame:
+    """Sort by subset[0] if it's timestamp-like then keep last duplicate."""
+    df = df.copy()
+    df = df.drop_duplicates(subset=subset, keep="last").reset_index(drop=True)
+    return df
+
+
+def to_delivery_hh_key(ts: pd.Series) -> pd.Series:
+    """
+    Canonical delivery half-hour key (tz-naive).
+    Force rounding/flooring to 30 minutes so merges are stable.
+    """
+    ts = pd.to_datetime(ts, errors="coerce")
+    return ts.dt.floor("30min")
+
+
+# -----------------------
+# 1) Pull datasets
+# -----------------------
+print("Pulling DA 48SP curve...")
+da_df = fetch_48sp_curve(START, END, DA_HH_RICS, curve_name="DA")
+
+print("Pulling MID market index...")
 mid_df = fetch_market_index_range_by_settlement_date(
-    start_date=start,
-    end_date=end,
+    start_date=START,
+    end_date=END,
     data_providers=["APXMIDP"],
 )
 
-# Ensure no duplicates
-mid_df = mid_df.sort_values("timestamp").drop_duplicates(subset=["timestamp"], keep="last")
-ssp_df = ssp_df.sort_values("timestamp").drop_duplicates(subset=["timestamp"], keep="last")
-sbp_df = sbp_df.sort_values("timestamp").drop_duplicates(subset=["timestamp"], keep="last")
-carbon_df = carbon_df.sort_values("timestamp").drop_duplicates(subset=["timestamp"], keep="last")
+print("Pulling UKA daily...")
+uka_df = fetch_uka_daily(START, END)
 
-# ---------- 1) Clean timestamps ----------
-def clean_ts(df: pd.DataFrame, ts_col: str = "timestamp") -> pd.DataFrame:
-    df = df.copy()
-    if ts_col not in df.columns:
-        raise KeyError(f"Expected column '{ts_col}' not found. Columns are: {list(df.columns)}")
-    df[ts_col] = pd.to_datetime(df[ts_col], utc=True).dt.tz_convert(None)
-    return df.sort_values(ts_col).reset_index(drop=True)
+print("Pulling CI forecast (forecast-only)...")
+ci_fc_df = fetch_ci_forecast(START, END, tz_naive=True, target_freq="30min")
 
-da_df     = clean_ts(da_df)
-ssp_df    = clean_ts(ssp_df)
-sbp_df    = clean_ts(sbp_df)
-mid_df    = clean_ts(mid_df)
-carbon_df = clean_ts(carbon_df)
+print("Pulling CI actual (historic realised)...")
+ci_act_df = fetch_carbon_sql(START, END)
 
-# ---------- 2) Align common time window ----------
-start_common = max(
-    carbon_df["timestamp"].min(),
-    da_df["timestamp"].min(),
-    ssp_df["timestamp"].min(),
-    sbp_df["timestamp"].min(),
-    mid_df["timestamp"].min(),
-)
-end_common = min(
-    carbon_df["timestamp"].max(),
-    da_df["timestamp"].max(),
-    ssp_df["timestamp"].max(),
-    sbp_df["timestamp"].max(),
-    mid_df["timestamp"].max(),
-)
+print("Computing MEF Model A...")
+mef_df = compute_mef_model_a(START, END, tz_naive=True)
 
-def clip(df: pd.DataFrame, start, end) -> pd.DataFrame:
-    m = (df["timestamp"] >= start) & (df["timestamp"] <= end)
-    return df.loc[m].reset_index(drop=True)
 
-da_df     = clip(da_df, start_common, end_common)
-ssp_df    = clip(ssp_df, start_common, end_common)
-sbp_df    = clip(sbp_df, start_common, end_common)
-mid_df    = clip(mid_df, start_common, end_common)
-carbon_df = clip(carbon_df, start_common, end_common)
+# -----------------------
+# 2) Clean timestamps + standardise keys
+# -----------------------
+# DA already has delivery_ts/trade_ts etc, but we still normalise.
+da_df = da_df.copy()
+for col in ["timestamp", "delivery_ts", "trade_ts"]:
+    if col in da_df.columns:
+        da_df[col] = pd.to_datetime(da_df[col], utc=True, errors="coerce").dt.tz_convert(None)
 
-# ---------- 3) Rename to avoid collisions ----------
-da_df  = da_df.rename(columns={"price_gbp_mwh": "da_price_gbp_mwh"})
-ssp_df = ssp_df.rename(columns={"price_gbp_mwh": "ssp_gbp_mwh"})
-sbp_df = sbp_df.rename(columns={"price_gbp_mwh": "sbp_gbp_mwh"})
+# Prefer delivery_ts as our canonical join key.
+if "delivery_ts" not in da_df.columns:
+    # fallback: DA implementations sometimes return timestamp only
+    if "timestamp" not in da_df.columns:
+        raise KeyError("DA dataframe missing both 'delivery_ts' and 'timestamp'.")
+    da_df["delivery_ts"] = to_delivery_hh_key(da_df["timestamp"])
+else:
+    da_df["delivery_ts"] = to_delivery_hh_key(da_df["delivery_ts"])
 
-# MID uses marketIndexPrice
+# MID is timestamp-based
+mid_df = clean_ts_utc_naive(mid_df, "timestamp")
+mid_df["delivery_ts"] = to_delivery_hh_key(mid_df["timestamp"])
+
+# CI forecast: timestamp-based already
+ci_fc_df = clean_ts_utc_naive(ci_fc_df, "timestamp")
+ci_fc_df["delivery_ts"] = to_delivery_hh_key(ci_fc_df["timestamp"])
+
+# CI actual: timestamp-based
+ci_act_df = clean_ts_utc_naive(ci_act_df, "timestamp")
+ci_act_df["delivery_ts"] = to_delivery_hh_key(ci_act_df["timestamp"])
+
+# MEF: timestamp-based
+mef_df = clean_ts_utc_naive(mef_df, "timestamp")
+mef_df["delivery_ts"] = to_delivery_hh_key(mef_df["timestamp"])
+
+# UKA: daily; we merge on delivery_date
+uka_df = clean_ts_utc_naive(uka_df, "timestamp")
+uka_df["delivery_date"] = uka_df["timestamp"].dt.floor("D")
+
+
+# -----------------------
+# 3) Rename columns to canonical names
+# -----------------------
+# DA
+if "price_gbp_mwh" in da_df.columns:
+    da_df = da_df.rename(columns={"price_gbp_mwh": "da_price_gbp_mwh"})
+elif "da_price_gbp_mwh" not in da_df.columns:
+    raise KeyError(f"DA missing price column. columns={da_df.columns.tolist()}")
+
+# MID
 if "marketIndexPrice" not in mid_df.columns:
-    raise KeyError(f"MID expected 'marketIndexPrice' but got {mid_df.columns.tolist()}")
+    raise KeyError(f"MID missing marketIndexPrice. columns={mid_df.columns.tolist()}")
 mid_df = mid_df.rename(columns={"marketIndexPrice": "mid_price_gbp_mwh"})
 
-# keep only merge columns
-carbon_df = carbon_df[["timestamp", "carbon_gco2_kwh"]]
-da_df     = da_df[["timestamp", "da_price_gbp_mwh", "trade_ts", "trade_date", "delivery_ts", "delivery_date", "settlement_period"]]
-ssp_df    = ssp_df[["timestamp", "ssp_gbp_mwh"]]
-sbp_df    = sbp_df[["timestamp", "sbp_gbp_mwh"]]
-mid_df    = mid_df[["timestamp", "mid_price_gbp_mwh", "settlementDate", "settlementPeriod", "dataProvider"]]
+# CI forecast
+if "ci_forecast_gco2_kwh" not in ci_fc_df.columns:
+    raise KeyError(f"CI forecast missing ci_forecast_gco2_kwh. columns={ci_fc_df.columns.tolist()}")
 
-# ---------- 4) Merge: use DA as base (48 half-hours per day), left-join others ----------
-# Inner join drops any timestamp missing in one source, often leaving only one full day.
-# Left from DA keeps all DA timestamps; fill missing from others so we keep all days.
-merged_df = (
+# CI actual
+if "ci_actual_gco2_kwh" not in ci_act_df.columns:
+    raise KeyError(f"CI actual missing carbon_gco2_kwh. columns={ci_act_df.columns.tolist()}")
+ci_act_df = ci_act_df.rename(columns={"ci_actual_gco2_kwh": "ci_actual_gco2_kwh"})
+
+# MEF
+if "mef_gco2_kwh" not in mef_df.columns:
+    raise KeyError(f"MEF missing mef_gco2_kwh. columns={mef_df.columns.tolist()}")
+
+# UKA
+if "uka_gbp_tco2" not in uka_df.columns:
+    raise KeyError(f"UKA missing uka_gbp_tco2. columns={uka_df.columns.tolist()}")
+
+
+# -----------------------
+# 4) De-duplicate on join keys
+# -----------------------
+da_df     = dedup_last(da_df, ["delivery_ts"])
+mid_df    = dedup_last(mid_df, ["delivery_ts"])
+ci_fc_df  = dedup_last(ci_fc_df, ["delivery_ts"])
+ci_act_df = dedup_last(ci_act_df, ["delivery_ts"])
+mef_df    = dedup_last(mef_df, ["delivery_ts"])
+
+uka_daily = (
+    uka_df.sort_values("timestamp")
+          .drop_duplicates("delivery_date", keep="last")
+          .loc[:, ["delivery_date", "uka_gbp_tco2"]]
+          .reset_index(drop=True)
+)
+
+
+# -----------------------
+# 5) Keep only needed columns
+# -----------------------
+da_keep = [
+    "delivery_ts",
+    "da_price_gbp_mwh",
+]
+# keep trade_ts/trade_date/delivery_date/tau if your DA loader already provides them;
+# otherwise we’ll regenerate later.
+optional_da_cols = ["trade_ts", "trade_date", "delivery_date", "settlement_period", "tau"]
+for c in optional_da_cols:
+    if c in da_df.columns:
+        da_keep.append(c)
+
+da_df = da_df[da_keep].copy()
+
+mid_df = mid_df[["delivery_ts", "mid_price_gbp_mwh"]].copy()
+ci_df  = ci_fc_df[["delivery_ts", "ci_forecast_gco2_kwh"]].merge(
+    ci_act_df[["delivery_ts", "ci_actual_gco2_kwh"]],
+    on="delivery_ts",
+    how="left",
+)
+mef_df = mef_df[["delivery_ts", "mef_gco2_kwh"]].copy()
+
+
+# -----------------------
+# 6) Merge everything on delivery_ts
+# -----------------------
+merged = (
     da_df
-    .merge(mid_df[["timestamp", "mid_price_gbp_mwh"]], on="timestamp", how="left")
-    .merge(ssp_df, on="timestamp", how="left")
-    .merge(sbp_df, on="timestamp", how="left")
-    .merge(carbon_df, on="timestamp", how="left")
-).sort_values("timestamp").reset_index(drop=True)
+    .merge(mid_df, on="delivery_ts", how="left")
+    .merge(ci_df,  on="delivery_ts", how="left")
+    .merge(mef_df, on="delivery_ts", how="left")
+    .sort_values("delivery_ts")
+    .reset_index(drop=True)
+)
 
-# Forward-fill then back-fill missing prices/carbon (e.g. sparse carbon or MID)
-for col in ["mid_price_gbp_mwh", "ssp_gbp_mwh", "sbp_gbp_mwh", "carbon_gco2_kwh"]:
-    merged_df[col] = merged_df[col].ffill().bfill()
+merged["delivery_date"] = pd.to_datetime(merged["delivery_ts"]).dt.floor("D")
 
-# Drop any rows that still have NaN (e.g. leading/lagging edges)
-merged_df = merged_df.dropna(subset=["mid_price_gbp_mwh", "carbon_gco2_kwh"]).reset_index(drop=True)
+merged = merged.merge(uka_daily, on="delivery_date", how="left")
 
-# ---------- 5) Canonical time columns (delivery_ts == timestamp) ----------
-merged_df["delivery_ts"] = merged_df["timestamp"]
-merged_df["delivery_date"] = merged_df["delivery_ts"].dt.floor("D")
 
-merged_df["tau"] = (
-    merged_df["delivery_ts"].dt.hour * 2
-    + (merged_df["delivery_ts"].dt.minute // 30)
-    + 1
-).astype(int)
+# -----------------------
+# 7) Canonical fields (trade_ts/trade_date/tau) if missing
+# -----------------------
+# tau = settlement period 1..48 from delivery_ts
+if "tau" not in merged.columns:
+    merged["tau"] = (
+        merged["delivery_ts"].dt.hour * 2
+        + (merged["delivery_ts"].dt.minute // 30)
+        + 1
+    ).astype(int)
 
-# agent “now” time for planning = D-1
-merged_df["trade_ts"] = merged_df["delivery_ts"] - pd.Timedelta(days=1)
-merged_df["trade_date"] = merged_df["trade_ts"].dt.floor("D")
+# trade_ts = delivery_ts - 1 day (simple “publish on D-1” convention)
+if "trade_ts" not in merged.columns:
+    merged["trade_ts"] = merged["delivery_ts"] - pd.Timedelta(days=1)
 
-# ---------- 6) Save ----------
-merged_df = merged_df.drop(columns=["timestamp"])
+if "trade_date" not in merged.columns:
+    merged["trade_date"] = merged["trade_ts"].dt.floor("D")
 
+
+# -----------------------
+# 8) Fill missing values
+# -----------------------
+# MID prices often have small gaps; forward/back fill is acceptable for training stability.
+# CI forecast can be ffilled (it’s a forecast series); actual CI should NOT be ffilled too aggressively,
+# but for env continuity, we fill small gaps after merge.
+fill_cols = [
+    "mid_price_gbp_mwh",
+    "ci_forecast_gco2_kwh",
+    "ci_actual_gco2_kwh",
+    "mef_gco2_kwh",
+    "uka_gbp_tco2",
+]
+for col in fill_cols:
+    if col in merged.columns:
+        merged[col] = merged[col].ffill().bfill()
+
+# Drop any remaining critical nulls
+merged = merged.dropna(
+    subset=[
+        "da_price_gbp_mwh",
+        "mid_price_gbp_mwh",
+        "ci_forecast_gco2_kwh",
+        "ci_actual_gco2_kwh",
+        "uka_gbp_tco2",
+        "mef_gco2_kwh",
+    ]
+).reset_index(drop=True)
+
+
+# -----------------------
+# 9) Ensure one row per (delivery_date, tau) and sorted
+# -----------------------
 cols = [
-    "trade_ts", "trade_date",
-    "delivery_ts", "delivery_date",
+    "trade_ts",
+    "trade_date",
+    "delivery_ts",
+    "delivery_date",
     "tau",
     "da_price_gbp_mwh",
     "mid_price_gbp_mwh",
-    "ssp_gbp_mwh",
-    "sbp_gbp_mwh",
-    "carbon_gco2_kwh",
+    "ci_forecast_gco2_kwh",
+    "ci_actual_gco2_kwh",
+    "mef_gco2_kwh",
+    "uka_gbp_tco2",
 ]
-merged_df = merged_df[cols].sort_values(["delivery_ts"]).reset_index(drop=True)
-merged_df = merged_df.drop_duplicates(subset=["delivery_date", "tau"], keep="first")
 
-# ---------- 5) Optional audit ----------
-RUN_AUDIT = False
-if RUN_AUDIT:
-    audit_alignment(mid_df, carbon_df)
+merged = merged[cols].sort_values(["delivery_ts"]).reset_index(drop=True)
+merged = merged.drop_duplicates(subset=["delivery_date", "tau"], keep="first").reset_index(drop=True)
 
-merged_df.to_parquet("data/training_data.parquet", index=False)
-n_days = merged_df["delivery_ts"].dt.floor("D").nunique()
-print("Saved:", len(merged_df), "rows,", n_days, "unique delivery days")
-print("Range delivery:", merged_df["delivery_ts"].min(), "→", merged_df["delivery_ts"].max())
+# sanity: tau in 1..48
+bad_tau = (~merged["tau"].between(1, 48)).mean()
+if bad_tau > 0:
+    raise ValueError("Found tau outside 1..48 after build.")
+
+OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+merged.to_parquet(OUT_PATH, index=False)
+
+print("Saved:", len(merged), "rows ->", str(OUT_PATH))
+print("Range:", merged["delivery_ts"].min(), "to", merged["delivery_ts"].max())
+print("Null %:", merged.isna().mean().sort_values(ascending=False).head(10).to_dict())
