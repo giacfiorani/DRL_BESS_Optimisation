@@ -1,15 +1,13 @@
-import eikon as ek, configparser as cp
-from pathlib import Path
-import pandas as pd
+from data_loader import fetch_demand_range, fetch_fuelhh_range, compute_mef_load_following_from_fuelhh
 
-cfg = cp.ConfigParser()
-cfg.read(Path("data") / "eikon.cfg")
-ek.set_app_key(cfg["eikon"]["app_id"].strip())
+start, end = "2022-01-01", "2024-01-01"
 
-ric = "EPXGBAUCD1H01H1"
-ts_short = ek.get_timeseries(ric, start_date="2021-01-01", end_date="2021-01-10", fields=["CLOSE"])
-ts_long  = ek.get_timeseries(ric, start_date="2021-01-01", end_date="2023-01-01", fields=["CLOSE"])
+demand_df = fetch_demand_range(start, end)
 
-print("short:", None if ts_short is None else ts_short.shape)
-print("long :", None if ts_long  is None else ts_long.shape)
-print(ts_long.head() if ts_long is not None else None)
+fuelhh_df = fetch_fuelhh_range(start, end, chunk_days=7, sleep_s=0.2, prefer_insights=True)
+print("FUELHH shape:", fuelhh_df.shape, "cols sample:", fuelhh_df.columns[:10])
+
+mef_df = compute_mef_load_following_from_fuelhh(fuelhh_df, demand_df)
+print(mef_df.head(), "MEF null %:", mef_df["mef_gco2_kwh"].isna().mean())
+
+mef_df.to_parquet("data/mef.parquet", index=False)

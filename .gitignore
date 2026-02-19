@@ -14,3 +14,7 @@ __pycache__/
 data/processed/
 results/runs/
 results/trained_models/
+
+agents/DQN_practice.py
+agents/agent.py
+agents/agent_config.py
