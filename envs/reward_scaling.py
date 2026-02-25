@@ -1,6 +1,7 @@
 import numpy as np
 from pathlib import Path
 import pandas as pd
+import env_config
 
 ROOT_DIR = Path(__file__).resolve().parents[1] if "__file__" in globals() else Path.cwd().parents[0]
 DATA_PATH = ROOT_DIR / "data" / "training_data.parquet"
@@ -14,10 +15,22 @@ dt = 0.5
 E_step_MWh = P_max_MW * dt
 E_step_kWh = E_step_MWh * 1000.0
 
+# --- Max Degradation Magnitude ---
+deg_kappa = 25.0
+deg_alpha = 4.0
+
+# The worst-case SoC is 1.0 (or 0.0), which maximizes the quadratic penalty
+worst_case_soc = 1.0
+max_stress_multiplier = 1.0 + deg_alpha * (worst_case_soc - 0.5)**2 
+
+# Calculate the maximum possible degradation cost in a single step
+max_deg_cost = deg_kappa * E_step_MWh * max_stress_multiplier
 # ---- PROFIT scale (DA+ID combined) ----
 da_abs  = df["da_price_gbp_mwh"].astype(float).abs().to_numpy()
 mid_abs = df["mid_price_gbp_mwh"].astype(float).abs().to_numpy()
-profit_series = (da_abs + mid_abs) * E_step_MWh   # £ per step proxy
+
+# Add max_deg_cost to account for the worst-case net-negative cashflow
+profit_series = ((da_abs + mid_abs) * E_step_MWh) + max_deg_cost   
 S_profit = np.percentile(profit_series, 95)
 
 # ---- CARBON CASHFLOW scale (monetised, £) ----
@@ -30,5 +43,5 @@ tco2_series = (ci_abs + mef_abs) * E_step_kWh / 1e6              # tCO2 per step
 carbon_cashflow_series = uka_abs * tco2_series                    # £ per step proxy
 S_carbon_gbp = np.percentile(carbon_cashflow_series, 95)
 
-print("S_profit (DA+ID, £):", S_profit)
+print("S_profit (DA+ID + Deg, £):", S_profit)
 print("S_carbon (monetised, £):", S_carbon_gbp)

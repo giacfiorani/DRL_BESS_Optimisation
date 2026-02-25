@@ -10,6 +10,13 @@ ROOT_DIR = Path(__file__).resolve().parents[1] if "__file__" in globals() else P
 DATA_PATH = ROOT_DIR / "data" / "training_data.parquet"
 df = pd.read_parquet(DATA_PATH).copy()
 
+
+# ====
+# Episode Parameters
+# ====
+
+episode_days = 30
+
 # ========
 # BESS HARDWARE SPECIFICATIONS (CATL EnerOne, Liquid-Cooled Rack)
 # ========
@@ -20,7 +27,6 @@ V_nominal = 1331.2  # V (nominal pack voltage)
 E_nominal = 372.7  # kWh (nominal energy)
 E_max = 0.3727  # MWh (same as E_nominal, converted to MWh)
 R_cell_mOhm = 0.4 # mΩ per cell (from Product Specification Sheet)
-
 
 # ========
 # OPERATIONAL PARAMETERS
@@ -35,6 +41,12 @@ SoC_initial = 0.5  # Initial SoC (fraction) - set to mid-range for safety
 eff_dis = 1.0  # Discharge efficiency (η_discharge = 1 per MDP)
 eff_ch = 0.99  # Charge efficiency (η_charge = 0.99)
 self_dis = 0.0  # Self-discharge rate per timestep (set to 0 for simplicity)
+
+# ======
+# DEGRADATION MODEL PARAMETERS
+# ======
+deg_kappa = 25.0
+deg_alpha = 4.0
 
 # ========
 # POWER AND TIMING PARAMETERS

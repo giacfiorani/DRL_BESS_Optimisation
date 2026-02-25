@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 from gymnasium import Env, spaces
 from pathlib import Path
+from degradation import SocWeightedDegradation #import degradation class
 
 class BatteryEnv(Env):
 
@@ -90,8 +91,15 @@ class BatteryEnv(Env):
         self.init_soc_high = float(self.SoC_max if init_soc_high is None else init_soc_high)
 
         #Scaling Factors for Profit and Carbon Penalty rewards
-        self.profit_scale = config.S_profit
-        self.carbon_scale = config.S_carbon_gbp
+        self.profit_scale = float(config.S_profit)
+        self.carbon_scale = float(config.S_carbon_gbp)
+
+        #Degradation parameters
+        self.deg_kappa = float(config.deg_kappa)
+        self.deg_alpha = float(config.deg_alpha)
+
+        # Instantiate Degradation Model
+        self.degradation_model = SocWeightedDegradation(self.deg_kappa, self.deg_alpha)
 
         # ========
         # Read from OCV Lookup Table and Interpolate to get OCV-SOC Curve
@@ -298,7 +306,7 @@ class BatteryEnv(Env):
 
         # The SoC update rule is:
         # charge (I<0): ΔSoC = -(I dt / Q) * η_ch
-        # discharge(I>0): ΔSoC = -(I dt / Q) / η_dis
+        # discharge(I>0): ΔSoC = -(I dt / Q) * (1 / η_dis)
         # So invert those to get current bounds:
         I_min = -(delta_soc_up_max   * Q) / (dt * self.eta_ch)   # most negative allowed
         I_max =  (delta_soc_down_max * Q * self.eta_dis) / dt    # most positive allowed
@@ -386,10 +394,13 @@ class BatteryEnv(Env):
             planned_idx = -1 
         
         planned_power_now = float(self.power_levels[planned_idx]) if planned_idx >= 0 else 0.0
-
+        
         tau_now = float(self.tau[idx])
-        da_avail = 1.0 if self._da_available_now(idx) else 0.0 # 1 if DA can be used for planningn right now
 
+        # 1. The Indicator Flag: Checks if it is past the 12:00 publish time
+        da_avail = 1.0 if self._da_available_now(idx) else -999.0 # 1 if DA can be used for planningn right now
+
+        # 2. The Zero-Masking Logic
         # tomorrow curves only visible after publish, and only if tomorrow exists
         if da_avail == 1.0:
             tomorrow_da = self._get_tomorrow_da_curve(idx)
@@ -397,7 +408,8 @@ class BatteryEnv(Env):
         else:
             tomorrow_da = np.zeros(48, dtype=np.float32)
             tomorrow_ci = np.zeros(48, dtype=np.float32)
-
+        
+        # 3. Construct the fixed-size state vector
         main = np.array(
             [self.soc, self.id_price[idx], self.ci[idx], tau_now, self.p_prev, da_avail, planned_power_now],
             dtype=np.float32,
@@ -465,6 +477,10 @@ class BatteryEnv(Env):
         P_req_MW = float(self.power_levels[dispatch_idx_eff])
         P_applied_MW, I_applied, V_oc_pack = self._apply_soc_protection(P_req_MW, self.soc)
 
+        
+        # Capture starting SoC for the degradation penalty
+        starting_soc = self.soc
+
         # --- SoC update ---
         if I_applied < 0.0:
             delta_soc = -(I_applied * self.dt_seconds / self.Q_pack_C) * self.eta_ch
@@ -491,10 +507,13 @@ class BatteryEnv(Env):
         E_plan_MWh = P_plan_MW * self.dt_hours
         E_dev_MWh  = P_dev_MW  * self.dt_hours
 
+        # DEGRADATION MODEL
+        deg_cost = self.degradation_model.calculate_costs(P_act_MW, dt_hours=self.dt_hours, soc_t=starting_soc)
+
       # Raw profits (£)
         R_DA = E_plan_MWh * da_price_now
         R_ID = E_dev_MWh  * id_price_now
-        R_total = R_DA + R_ID
+        R_total = R_DA + R_ID - deg_cost
 
         # Carbon cashflow (£) using UKA price
         E_act_MWh = P_act_MW * self.dt_hours
@@ -508,6 +527,8 @@ class BatteryEnv(Env):
         profit_norm = np.tanh(R_total / self.profit_scale)
         carbon_norm = np.tanh(carbon_cashflow_gbp / self.carbon_scale)
 
+        
+
         # Reward decomposition (Plan + Adjust):
         #
         # • DA revenue:
@@ -517,13 +538,16 @@ class BatteryEnv(Env):
         #   Any deviation between actual dispatch and DA plan is settled
         #   at the intraday (MID) price.
         #
+        # • Degradation cost:
+        #   Subtracted directly from the gross market revenue to calculate Net Profit.
+        #   Modeled as a SoC-weighted marginal cost of energy throughput.
+        #
         # • Carbon penalty:
         #   Applied to actual energy imported/exported, based on realised
         #   carbon intensity.
         #
         # This mirrors a realistic DA commitment with intraday rebalancing,
         # while physical infeasibility is prevented by SoC safety shielding.
-        # λ is a hyperparameter: carbon preference weight
         reward = profit_norm - self.lambda_ci * carbon_norm
 
         self.p_prev = float(P_applied_MW)
