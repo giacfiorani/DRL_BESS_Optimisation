@@ -61,7 +61,7 @@ dt = 0.5  # hours (timestep = 30 minutes)
 lambda_ci = 0.9  # Carbon penalty weight (λ) - tunable scalar
 
 # For discrete action space, we need to define the number of power levels
-n_power_levels = 11
+n_power_levels = 11 
 
 #reward scaling values
 S_profit = reward_scaling.S_profit

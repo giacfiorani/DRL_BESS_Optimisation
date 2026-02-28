@@ -1,9 +1,12 @@
 import numpy as np
 
+# DEGRADATION MODEL: Cortés-Arcos et al. (2020)
+# Linear Marginal Throughput Cost (Equation 21 & 23)
 class SocWeightedDegradation:
     def __init__(self, kappa:float, alpha:float):
         self.kappa = kappa
         self.alpha = alpha
-    def calculate_costs(self, P_act_MW:float, dt_hours:float, soc_t:float):
-        Cost = self.kappa * abs(P_act_MW) * dt_hours * (1 + self.alpha * ((soc_t - 0.5)**2))
-        return Cost
+    def calculate_costs(self, P_act_MW:float, dt_hours:float):
+        cost = self.deg_kappa * abs(P_act_MW) * self.dt_hours
+        return cost
+

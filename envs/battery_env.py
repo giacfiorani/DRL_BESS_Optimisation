@@ -398,7 +398,7 @@ class BatteryEnv(Env):
         tau_now = float(self.tau[idx])
 
         # 1. The Indicator Flag: Checks if it is past the 12:00 publish time
-        da_avail = 1.0 if self._da_available_now(idx) else -999.0 # 1 if DA can be used for planningn right now
+        da_avail = 1.0 if self._da_available_now(idx) else 0 # 1 if DA can be used for planningn right now
 
         # 2. The Zero-Masking Logic
         # tomorrow curves only visible after publish, and only if tomorrow exists
@@ -508,9 +508,9 @@ class BatteryEnv(Env):
         E_dev_MWh  = P_dev_MW  * self.dt_hours
 
         # DEGRADATION MODEL
-        deg_cost = self.degradation_model.calculate_costs(P_act_MW, dt_hours=self.dt_hours, soc_t=starting_soc)
+        deg_cost = self.degradation_model.calculate_costs(P_act_MW, dt_hours=self.dt_hours)
 
-      # Raw profits (£)
+        # Raw profits (£)
         R_DA = E_plan_MWh * da_price_now
         R_ID = E_dev_MWh  * id_price_now
         R_total = R_DA + R_ID - deg_cost
