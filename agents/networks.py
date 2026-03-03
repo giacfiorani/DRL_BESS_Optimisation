@@ -6,7 +6,7 @@ import numpy as np
 import os 
 
 class DeepQNetwork(nn.Module):
-    def __init__(self, lr, input_dims=103, fc1_dims=256, fc2_dims=256, n_actions=5808):
+    def __init__(self, lr, input_dims, fc1_dims, fc2_dims, n_actions):
         super(DeepQNetwork, self).__init__()
         self.input_dims = input_dims 
         self.fc1_dims = fc1_dims 
@@ -31,7 +31,7 @@ class DeepQNetwork(nn.Module):
 
     # Handling forward propagation
     def forward(self, state):
-        x = F.relu(self.fc1(T.from_numpy(state))
+        x = F.relu(self.fc1(T.from_numpy(state)))
         x = F.relu(self.fc2(x))
         q_values = self.fc3(x)
 
