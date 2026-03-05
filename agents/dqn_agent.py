@@ -10,7 +10,7 @@ from replay_buffer import ReplayBuffer
 
 class DQNAgent():
 
-    def __init__(self, gamma, epsilon, lr, input_dims, batch_size, n_actions, lambda_ci,n_power_levels,
+    def __init__(self, gamma, epsilon, lr, input_dims, batch_size, n_actions, lambda_ci,
                         max_mem_size = 100000, eps_min =0.01, eps_dec=1e-5):
         self.gamma = gamma
         self.epsilon = epsilon
@@ -20,14 +20,13 @@ class DQNAgent():
         self.batch_size = batch_size
         self.mem_size = max_mem_size
         self.lambda_ci = lambda_ci # set in env_config.py - carbon penalty weight
-        self.n_power_levels = n_power_levels # set in env_config.py - number of power levels for the action space
         self.action_space =  [i for i in range(self.n_actions)] # TO BE LOOKED AT MORE CAREFULLY
         self.eps_dec = eps_dec
         self.eps_min = eps_min
         self.mem_cntr = 0 # memory counter to keep track of the first available memory point
         
 
-        self.Q_eval = DeepQNetwork(self.lr, n_actions=5808, input_dims=103, fc1_dims=256, fc2_dims=256)
+        self.Q_eval = DeepQNetwork(self.lr, n_actions=self.n_actions, input_dims=self.input_dims, fc1_dims=256, fc2_dims=256)
         
         #call the replay buffer 
         self.memory = ReplayBuffer(max_size=max_mem_size)

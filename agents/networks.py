@@ -31,7 +31,7 @@ class DeepQNetwork(nn.Module):
 
     # Handling forward propagation
     def forward(self, state):
-        x = F.relu(self.fc1(T.from_numpy(state)))
+        x = F.relu(self.fc1(state))
         x = F.relu(self.fc2(x))
         q_values = self.fc3(x)
 
