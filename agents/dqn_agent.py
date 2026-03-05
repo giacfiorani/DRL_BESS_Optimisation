@@ -4,8 +4,9 @@ import random
 from collections import deque
 
 from torch.nn.functional import smooth_l1_loss
-from networks import DeepQNetwork
-from replay_buffer import ReplayBuffer
+from agents.networks import DeepQNetwork
+from agents.replay_buffer import ReplayBuffer
+import copy
 
 
 class DQNAgent():
@@ -27,7 +28,11 @@ class DQNAgent():
         
 
         self.Q_eval = DeepQNetwork(self.lr, n_actions=self.n_actions, input_dims=self.input_dims, fc1_dims=256, fc2_dims=256)
-        
+        self.Q_target = copy.deepcopy(self.Q_eval)
+        self.learn_step_counter = 0
+        self.target_update_frequency = 100 #update target every 100 steps.
+
+
         #call the replay buffer 
         self.memory = ReplayBuffer(max_size=max_mem_size)
 
@@ -75,7 +80,7 @@ class DQNAgent():
         q_pred = q_eval.gather(1, actions.unsqueeze(-1)).squeeze(-1)
         
         # Target Q-values (The Bellman Equation)
-        q_next = self.Q_eval.forward(states_).detach()
+        q_next = self.Q_target.forward(states_).detach()
         max_q_next = T.max(q_next, dim=1)[0]
 
         # Mask the target if the episode is done
@@ -93,7 +98,12 @@ class DQNAgent():
             self.epsilon -= self.eps_dec
         else:
             self.epsilon = self.eps_min
-        
+
+        # Target network update
+        self.learn_step_counter += 1
+        if self.learn_step_counter % self.target_update_frequency == 0:
+            self.Q_target.load_state_dict(self.Q_eval.state_dict())
+
 
 
 

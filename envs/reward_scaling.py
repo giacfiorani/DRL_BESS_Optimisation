@@ -1,7 +1,7 @@
 import numpy as np
 from pathlib import Path
 import pandas as pd
-import env_config
+import envs.env_config
 
 ROOT_DIR = Path(__file__).resolve().parents[1] if "__file__" in globals() else Path.cwd().parents[0]
 DATA_PATH = ROOT_DIR / "data" / "training_data.parquet"

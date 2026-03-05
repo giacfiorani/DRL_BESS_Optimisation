@@ -3,7 +3,7 @@ import pandas as pd
 import numpy as np
 from gymnasium import Env, spaces
 from pathlib import Path
-from degradation import SocWeightedDegradation #import degradation class
+from envs.degradation import SocWeightedDegradation #import degradation class
 
 class BatteryEnv(Env):
 

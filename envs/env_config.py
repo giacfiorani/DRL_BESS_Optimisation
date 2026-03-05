@@ -1,7 +1,7 @@
 import numpy as np
 from pathlib import Path
 import pandas as pd
-import reward_scaling
+from envs import reward_scaling
 
 # ====
 # Load Whole dataset dataframe
