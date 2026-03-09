@@ -37,6 +37,7 @@ class BatteryEnv(Env):
         publish_hour: int = 12,
         episode_days: int = 30,
         randomize_init_soc: bool = True,
+        lambda_ci: float | None= None,
         init_soc_low: float = 0.3,   # if None -> use SoC_min
         init_soc_high: float = 0.7,  # if None -> use SoC_max
         seed: int | None = None,
@@ -80,7 +81,7 @@ class BatteryEnv(Env):
         self.n_power_levels = config.n_power_levels
 
         # Reward config: carbon weight λ
-        self.lambda_ci = float(config.lambda_ci)
+        self.lambda_ci = float(lambda_ci if lambda_ci is not None else config.lambda_ci)
         
         # ECM R-int model parameter (internal resistance)
         self.R_cell_mOhm = config.R_cell_mOhm  # mΩ per cell
@@ -385,17 +386,13 @@ class BatteryEnv(Env):
     def _get_obs(self) -> np.ndarray:
 
         idx = int(self.current_day_idxs[self.slot0]) # row index of current settlement period
-
         tau0 = int(self.tau[idx]) - 1
 
         # convert plan index to Power
         planned_idx = int(self.today_plan[tau0])
         if planned_idx < 0 or planned_idx >= self.n_power_levels:
             planned_idx = -1 
-        
         planned_power_now = float(self.power_levels[planned_idx]) if planned_idx >= 0 else 0.0
-        
-        tau_now = float(self.tau[idx])
 
         # 1. The Indicator Flag: Checks if it is past the 12:00 publish time
         da_avail = 1.0 if self._da_available_now(idx) else 0 # 1 if DA can be used for planningn right now
@@ -409,13 +406,24 @@ class BatteryEnv(Env):
             tomorrow_da = np.zeros(48, dtype=np.float32)
             tomorrow_ci = np.zeros(48, dtype=np.float32)
         
+        # --- Normalise ---
+        soc_n           = float(self.soc)                                        # [0,1]
+        price_n         = float(np.tanh(self.id_price[idx] / self.price_scale))  # [-1,1]
+        ci_n            = float(np.tanh(self.ci[idx] / self.ci_scale))           # [-1,1]
+        tau_n           = float(self.tau[idx]) / 48.0                            # [0,1]
+        p_prev_n        = float(self.p_prev / self.P_max_MW)                     # [-1,1]
+        da_avail_n      = da_avail                                               # {0,1}
+        planned_power_n = float(planned_power_now / self.P_max_MW)               # [-1,1]
+
+        tomorrow_da_n = np.tanh(tomorrow_da / self.price_scale).astype(np.float32)
+        tomorrow_ci_n = np.tanh(tomorrow_ci / self.ci_scale).astype(np.float32)
+            
         # 3. Construct the fixed-size state vector
         main = np.array(
-            [self.soc, self.id_price[idx], self.ci[idx], tau_now, self.p_prev, da_avail, planned_power_now],
+            [soc_n, price_n, ci_n, tau_n, p_prev_n, da_avail_n, planned_power_n],
             dtype=np.float32,
         )
-
-        return np.concatenate([main, tomorrow_da, tomorrow_ci], axis=0)
+        return np.concatenate([main, tomorrow_da_n, tomorrow_ci_n], axis=0)
 
     
     # -----------------

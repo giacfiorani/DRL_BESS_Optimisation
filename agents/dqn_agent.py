@@ -11,7 +11,7 @@ import copy
 
 class DQNAgent():
 
-    def __init__(self, gamma, epsilon, lr, input_dims, batch_size, n_actions, lambda_ci,
+    def __init__(self, gamma, epsilon, lr, input_dims, batch_size, n_actions,
                         max_mem_size = 100000, eps_min =0.01, eps_dec=1e-5):
         self.gamma = gamma
         self.epsilon = epsilon
@@ -20,8 +20,7 @@ class DQNAgent():
         self.input_dims = input_dims
         self.batch_size = batch_size
         self.mem_size = max_mem_size
-        self.lambda_ci = lambda_ci # set in env_config.py - carbon penalty weight
-        self.action_space =  [i for i in range(self.n_actions)] # TO BE LOOKED AT MORE CAREFULLY
+        self.action_space =  [i for i in range(self.n_actions)]
         self.eps_dec = eps_dec
         self.eps_min = eps_min
         self.mem_cntr = 0 # memory counter to keep track of the first available memory point
@@ -30,7 +29,7 @@ class DQNAgent():
         self.Q_eval = DeepQNetwork(self.lr, n_actions=self.n_actions, input_dims=self.input_dims, fc1_dims=256, fc2_dims=256)
         self.Q_target = copy.deepcopy(self.Q_eval)
         self.learn_step_counter = 0
-        self.target_update_frequency = 100 #update target every 100 steps.
+        self.target_update_frequency = 1000 #update target every 1000 steps.
 
 
         #call the replay buffer 
@@ -45,15 +44,15 @@ class DQNAgent():
             action = np.random.randint(self.n_actions)
         else:
             # EXPLOIT: Use the brain
-            # 1. Convert to tensor, move to GPU/CPU, add batch dimension
-            state = T.tensor(observation, dtype=T.float32).to(self.Q_eval.device).unsqueeze(0)
-            
-            # 2. Get the Q-values (predictions)
-            q_values = self.Q_eval.forward(state)
-            
-            # 3. Find the index of the highest prediction
-            action = T.argmax(q_values, dim=1).item() # we could remove the dim=1
-
+            self.Q_eval.eval()
+            with T.no_grad():
+                # 1. Convert to tensor, move to GPU/CPU, add batch dimension
+                state = T.tensor(observation, dtype=T.float32).to(self.Q_eval.device).unsqueeze(0)
+                # 2. Get the Q-values (predictions)
+                q_values = self.Q_eval.forward(state)
+                # 3. Find the index of the highest prediction
+                action = T.argmax(q_values, dim=1).item() # we could remove the dim=1
+            self.Q_eval.train()
         return action
 
     def learn(self):
@@ -91,6 +90,7 @@ class DQNAgent():
 
         # optimise the model
         loss.backward()
+        T.nn.utils.clip_grad_norm_(self.Q_eval.parameters(), max_norm=10.0)
         self.Q_eval.optimiser.step()
 
         # Epsilon decay logic

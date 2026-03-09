@@ -1,7 +1,8 @@
 import numpy as np
+from envs.env_config import n_power_levels
 
-ACTION_SHAPE = (11,11,48)
-N_ACTIONS = 11 * 11 * 48
+ACTION_SHAPE = (n_power_levels,n_power_levels,48)
+N_ACTIONS = n_power_levels * n_power_levels * 48
 
 def encode(dispatch_idx:int , plan_idx:int , plan_slot:int) -> int:
     """Map a (dispatch_idx, plan_idx, plan_slot) tuple to a flat integer."""

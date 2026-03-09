@@ -67,6 +67,14 @@ n_power_levels = 11
 S_profit = reward_scaling.S_profit
 S_carbon_gbp= reward_scaling.S_carbon_gbp
 
+# =======
+# OBSERVATION SCALING
+# =======
+
+S_price = reward_scaling.S_price
+S_ci    = reward_scaling.S_ci
+
+
 # ========
 # OCV LOOKUP TABLE (The DC OCV-SOC Curve from Spec Sheet @25°C)
 # ========
