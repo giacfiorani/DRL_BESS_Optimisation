@@ -94,6 +94,8 @@ class BatteryEnv(Env):
         #Scaling Factors for Profit and Carbon Penalty rewards
         self.profit_scale = float(config.S_profit)
         self.carbon_scale = float(config.S_carbon_gbp)
+        self.price_scale = float(config.S_price)
+        self.ci_scale = float(config.S_ci)
 
         #Degradation parameters
         self.deg_kappa = float(config.deg_kappa)
@@ -579,40 +581,46 @@ class BatteryEnv(Env):
         obs = self._get_obs()
 
         info = {
-            "trade_date": str(pd.Timestamp(self.trade_date[idx])),
-            "delivery_date": str(pd.Timestamp(self.delivery_date[idx])),
-            "tau": int(tau0 + 1),
-            "decision_ts": str(pd.Timestamp(decision_ts)),
+            #"trade_date": str(pd.Timestamp(self.trade_date[idx])),
+            #"delivery_date": str(pd.Timestamp(self.delivery_date[idx])),
+           # --- Essential Timestamps / Indices ---
             "delivery_ts": str(pd.Timestamp(self.delivery_ts[idx])),
-		    "trade_ts": str(pd.Timestamp(self.trade_ts[idx])),
+            "tau": int(tau0 + 1),
+            "idx": int(idx),
+            "days_done": int(self.days_done),
 
-            "dispatch_idx_exec": int(dispatch_idx_eff),
+            # --- Agent Action Tracking ---
             "dispatch_idx_agent": int(action[0]),
             "plan_idx_agent": int(action[1]),
-            "planned_idx_today" : int(planned_idx),
             "plan_slot_agent": int(plan_slot),
+            "planned_idx_today" : int(planned_idx),
             "tomorrow_plan_value_written": int(self.tomorrow_plan[plan_slot]) if da_avail else -999,
-            "mef_now": float(mef_now),
-            "carbon_price_now": float(carbon_price_now),
-            "idx": int(idx),
+            "da_available": bool(da_avail),
 
+            # --- Physical Battery Physics ---
             "P_req_MW": float(P_req_MW),
-            "P_planned_MW" : float(P_plan_MW),
-            "P_dev_MW" : float(P_dev_MW),
+            "P_planned_MW" : float(P_plan_MW),     # (Also acts as DA_dispatched_MW)
+            "P_dev_MW" : float(P_dev_MW),          # (Also acts as ID_dispatched_MW)
             "P_applied_MW": float(P_applied_MW),
+            "soc": float(self.soc),
             "delta_soc": float(delta_soc),
 
-            "id_price_now": float(id_price_now),
+            # --- Market & Environment Variables ---
             "da_price_now": float(da_price_now),
+            "id_price_now": float(id_price_now),
             "ci_now": float(ci_now),
+            "mef_now": float(mef_now),
+            "carbon_price_now": float(carbon_price_now),
+
+            # --- Episode Accumulators (For TensorBoard) ---
             "Planned_Profit": float(R_DA),
             "Intraday_Profit": float(R_ID),
+            "degradation_cost_gbp": float(deg_cost), 
+            "net_carbon_tCO2": float(net_tCO2),      
+
+            # --- Neural Network Normalisation ---
             "profit_norm": float(profit_norm),
             "carbon_penalty_norm": float(carbon_norm),
-
-            "da_available": bool(da_avail),
-            "days_done": int(self.days_done),
-            "soc": float(self.soc),
         }
 
         return obs, float(reward), bool(terminated), bool(truncated), info

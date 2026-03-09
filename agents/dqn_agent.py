@@ -58,7 +58,7 @@ class DQNAgent():
     def learn(self):
         # 1. Only start learning if we have enough memory
         if len(self.memory) < self.batch_size:
-            return
+            return None, None, None
         
         # 2. Reset the otpimiser gradients to zero - should we?
         self.Q_eval.optimiser.zero_grad()
@@ -90,8 +90,20 @@ class DQNAgent():
 
         # optimise the model
         loss.backward()
+
+        # Capture pre-clip grad norm (tells you when gradients were exploding)
+        total_norm = 0.0
+        for p in self.Q_eval.parameters():
+            if p.grad is not None:
+                total_norm += p.grad.data.norm(2).item() ** 2
+        grad_norm = total_norm ** 0.5
+
         T.nn.utils.clip_grad_norm_(self.Q_eval.parameters(), max_norm=10.0)
         self.Q_eval.optimiser.step()
+
+        # Mean max Q-valuye over the batch (proxy for value estimate health)
+        with T.no_grad():
+            q_mean = q_eval.max(dim=1)[0].mean().item()
 
         # Epsilon decay logic
         if self.epsilon > self.eps_min:
@@ -103,6 +115,8 @@ class DQNAgent():
         self.learn_step_counter += 1
         if self.learn_step_counter % self.target_update_frequency == 0:
             self.Q_target.load_state_dict(self.Q_eval.state_dict())
+
+        return loss.item(), grad_norm, q_mean
 
 
 
