@@ -1,7 +1,7 @@
 import numpy as np
 from pathlib import Path
 import pandas as pd
-import env_config
+import envs.env_config
 
 ROOT_DIR = Path(__file__).resolve().parents[1] if "__file__" in globals() else Path.cwd().parents[0]
 DATA_PATH = ROOT_DIR / "data" / "training_data.parquet"
@@ -14,6 +14,10 @@ P_max_MW = C_rate * E_max
 dt = 0.5
 E_step_MWh = P_max_MW * dt
 E_step_kWh = E_step_MWh * 1000.0
+
+# ====
+# REWARD SCALING
+#=====
 
 # --- Max Degradation Magnitude ---
 deg_kappa = 25.0
@@ -43,5 +47,21 @@ tco2_series = (ci_abs + mef_abs) * E_step_kWh / 1e6              # tCO2 per step
 carbon_cashflow_series = uka_abs * tco2_series                    # £ per step proxy
 S_carbon_gbp = np.percentile(carbon_cashflow_series, 95)
 
+# =====
+# OBSERVATION SCALING
+# =====
+
+# ---- Price scale (for observation normalisation) ----
+price_series = np.abs(df["da_price_gbp_mwh"].to_numpy(dtype=float))
+S_price = np.percentile(price_series, 95)   # ~£/MWh typical peak
+
+# ---- Carbon Intensity scale (for observation normalisation) ----
+ci_series = np.abs(df["ci_actual_gco2_kwh"].to_numpy(dtype=float))
+S_ci = np.percentile(ci_series, 95)
+
+# PRINTING SCALES
+
+print(f"S_price: {S_price:.2f} £/MWh")
+print(f"S_ci:    {S_ci:.2f} gCO2/kWh")
 print("S_profit (DA+ID + Deg, £):", S_profit)
 print("S_carbon (monetised, £):", S_carbon_gbp)

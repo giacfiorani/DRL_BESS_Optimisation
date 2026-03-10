@@ -3,7 +3,7 @@ import pandas as pd
 import numpy as np
 from gymnasium import Env, spaces
 from pathlib import Path
-from degradation import SocWeightedDegradation #import degradation class
+from envs.degradation import ThroughputDegradation
 
 class BatteryEnv(Env):
 
@@ -33,13 +33,17 @@ class BatteryEnv(Env):
 
     def __init__(
         self,
-        config, # if different configurations want to be included 
+        config,
         publish_hour: int = 12,
         episode_days: int = 30,
         randomize_init_soc: bool = True,
-        init_soc_low: float = 0.3,   # if None -> use SoC_min
-        init_soc_high: float = 0.7,  # if None -> use SoC_max
+        lambda_ci: float | None = None,
+        init_soc_low: float = 0.3,
+        init_soc_high: float = 0.7,
         seed: int | None = None,
+        split: str = "train",       # "train" | "val" | "test"
+        train_ratio: float = 0.70,
+        val_ratio: float = 0.15,
     ):
         # env initialisation
         super().__init__()
@@ -80,7 +84,7 @@ class BatteryEnv(Env):
         self.n_power_levels = config.n_power_levels
 
         # Reward config: carbon weight λ
-        self.lambda_ci = float(config.lambda_ci)
+        self.lambda_ci = float(lambda_ci if lambda_ci is not None else config.lambda_ci)
         
         # ECM R-int model parameter (internal resistance)
         self.R_cell_mOhm = config.R_cell_mOhm  # mΩ per cell
@@ -93,13 +97,14 @@ class BatteryEnv(Env):
         #Scaling Factors for Profit and Carbon Penalty rewards
         self.profit_scale = float(config.S_profit)
         self.carbon_scale = float(config.S_carbon_gbp)
+        self.price_scale = float(config.S_price)
+        self.ci_scale = float(config.S_ci)
 
         #Degradation parameters
         self.deg_kappa = float(config.deg_kappa)
-        self.deg_alpha = float(config.deg_alpha)
 
-        # Instantiate Degradation Model
-        self.degradation_model = SocWeightedDegradation(self.deg_kappa, self.deg_alpha)
+        # Instantiate Degradation Model — Cortés-Arcos et al. (2020) Eq. 23
+        self.degradation_model = ThroughputDegradation(self.deg_kappa)
 
         # ========
         # Read from OCV Lookup Table and Interpolate to get OCV-SOC Curve
@@ -175,6 +180,25 @@ class BatteryEnv(Env):
         self.valid_days = np.array(sorted(valid_days), dtype="datetime64[D]")
         self.day_indices = day_indices
         self.day_pos = {d: i for i, d in enumerate(self.valid_days)}
+
+        # ========
+        # Chronological 70 / 15 / 15 train / val / test split
+        # Never shuffle — this is time-series data.
+        # ========
+        n = len(self.valid_days)
+        n_train = int(n * train_ratio)
+        n_val   = int(n * val_ratio)
+        self.valid_days_train = self.valid_days[:n_train]
+        self.valid_days_val   = self.valid_days[n_train : n_train + n_val]
+        self.valid_days_test  = self.valid_days[n_train + n_val :]
+
+        _split_map = {"train": self.valid_days_train,
+                      "val":   self.valid_days_val,
+                      "test":  self.valid_days_test}
+        if split not in _split_map:
+            raise ValueError(f"split must be 'train', 'val', or 'test'. Got: {split!r}")
+        self.split = split
+        self.active_valid_days = _split_map[split]
 
         # ========
         # 3) ACTION SPACE
@@ -385,17 +409,13 @@ class BatteryEnv(Env):
     def _get_obs(self) -> np.ndarray:
 
         idx = int(self.current_day_idxs[self.slot0]) # row index of current settlement period
-
         tau0 = int(self.tau[idx]) - 1
 
         # convert plan index to Power
         planned_idx = int(self.today_plan[tau0])
         if planned_idx < 0 or planned_idx >= self.n_power_levels:
             planned_idx = -1 
-        
         planned_power_now = float(self.power_levels[planned_idx]) if planned_idx >= 0 else 0.0
-        
-        tau_now = float(self.tau[idx])
 
         # 1. The Indicator Flag: Checks if it is past the 12:00 publish time
         da_avail = 1.0 if self._da_available_now(idx) else 0 # 1 if DA can be used for planningn right now
@@ -409,13 +429,24 @@ class BatteryEnv(Env):
             tomorrow_da = np.zeros(48, dtype=np.float32)
             tomorrow_ci = np.zeros(48, dtype=np.float32)
         
+        # --- Normalise ---
+        soc_n           = float(self.soc)                                        # [0,1]
+        price_n         = float(np.tanh(self.id_price[idx] / self.price_scale))  # [-1,1]
+        ci_n            = float(np.tanh(self.ci[idx] / self.ci_scale))           # [-1,1]
+        tau_n           = float(self.tau[idx]) / 48.0                            # [0,1]
+        p_prev_n        = float(self.p_prev / self.P_max_MW)                     # [-1,1]
+        da_avail_n      = da_avail                                               # {0,1}
+        planned_power_n = float(planned_power_now / self.P_max_MW)               # [-1,1]
+
+        tomorrow_da_n = np.tanh(tomorrow_da / self.price_scale).astype(np.float32)
+        tomorrow_ci_n = np.tanh(tomorrow_ci / self.ci_scale).astype(np.float32)
+            
         # 3. Construct the fixed-size state vector
         main = np.array(
-            [self.soc, self.id_price[idx], self.ci[idx], tau_now, self.p_prev, da_avail, planned_power_now],
+            [soc_n, price_n, ci_n, tau_n, p_prev_n, da_avail_n, planned_power_n],
             dtype=np.float32,
         )
-
-        return np.concatenate([main, tomorrow_da, tomorrow_ci], axis=0)
+        return np.concatenate([main, tomorrow_da_n, tomorrow_ci_n], axis=0)
 
     
     # -----------------
@@ -478,9 +509,6 @@ class BatteryEnv(Env):
         P_applied_MW, I_applied, V_oc_pack = self._apply_soc_protection(P_req_MW, self.soc)
 
         
-        # Capture starting SoC for the degradation penalty
-        starting_soc = self.soc
-
         # --- SoC update ---
         if I_applied < 0.0:
             delta_soc = -(I_applied * self.dt_seconds / self.Q_pack_C) * self.eta_ch
@@ -507,7 +535,7 @@ class BatteryEnv(Env):
         E_plan_MWh = P_plan_MW * self.dt_hours
         E_dev_MWh  = P_dev_MW  * self.dt_hours
 
-        # DEGRADATION MODEL
+        # DEGRADATION COST — Cortés-Arcos et al. (2020) Eq. 23
         deg_cost = self.degradation_model.calculate_costs(P_act_MW, dt_hours=self.dt_hours)
 
         # Raw profits (£)
@@ -571,40 +599,46 @@ class BatteryEnv(Env):
         obs = self._get_obs()
 
         info = {
-            "trade_date": str(pd.Timestamp(self.trade_date[idx])),
-            "delivery_date": str(pd.Timestamp(self.delivery_date[idx])),
-            "tau": int(tau0 + 1),
-            "decision_ts": str(pd.Timestamp(decision_ts)),
+            #"trade_date": str(pd.Timestamp(self.trade_date[idx])),
+            #"delivery_date": str(pd.Timestamp(self.delivery_date[idx])),
+           # --- Essential Timestamps / Indices ---
             "delivery_ts": str(pd.Timestamp(self.delivery_ts[idx])),
-		    "trade_ts": str(pd.Timestamp(self.trade_ts[idx])),
+            "tau": int(tau0 + 1),
+            "idx": int(idx),
+            "days_done": int(self.days_done),
 
-            "dispatch_idx_exec": int(dispatch_idx_eff),
+            # --- Agent Action Tracking ---
             "dispatch_idx_agent": int(action[0]),
             "plan_idx_agent": int(action[1]),
-            "planned_idx_today" : int(planned_idx),
             "plan_slot_agent": int(plan_slot),
+            "planned_idx_today" : int(planned_idx),
             "tomorrow_plan_value_written": int(self.tomorrow_plan[plan_slot]) if da_avail else -999,
-            "mef_now": float(mef_now),
-            "carbon_price_now": float(carbon_price_now),
-            "idx": int(idx),
+            "da_available": bool(da_avail),
 
+            # --- Physical Battery Physics ---
             "P_req_MW": float(P_req_MW),
-            "P_planned_MW" : float(P_plan_MW),
-            "P_dev_MW" : float(P_dev_MW),
+            "P_planned_MW" : float(P_plan_MW),     # (Also acts as DA_dispatched_MW)
+            "P_dev_MW" : float(P_dev_MW),          # (Also acts as ID_dispatched_MW)
             "P_applied_MW": float(P_applied_MW),
+            "soc": float(self.soc),
             "delta_soc": float(delta_soc),
 
-            "id_price_now": float(id_price_now),
+            # --- Market & Environment Variables ---
             "da_price_now": float(da_price_now),
+            "id_price_now": float(id_price_now),
             "ci_now": float(ci_now),
+            "mef_now": float(mef_now),
+            "carbon_price_now": float(carbon_price_now),
+
+            # --- Episode Accumulators (For TensorBoard) ---
             "Planned_Profit": float(R_DA),
             "Intraday_Profit": float(R_ID),
+            "degradation_cost_gbp": float(deg_cost), 
+            "net_carbon_tCO2": float(net_tCO2),      
+
+            # --- Neural Network Normalisation ---
             "profit_norm": float(profit_norm),
             "carbon_penalty_norm": float(carbon_norm),
-
-            "da_available": bool(da_avail),
-            "days_done": int(self.days_done),
-            "soc": float(self.soc),
         }
 
         return obs, float(reward), bool(terminated), bool(truncated), info
@@ -626,15 +660,17 @@ class BatteryEnv(Env):
         self.p_prev = 0.0
         self.days_done = 0
 
-        # Choose starting day (enough room to run episode_days)
+        # Choose starting day within the active split, with enough room for episode_days
         if options is not None and options.get("delivery_day") is not None:
             start_day = np.datetime64(pd.to_datetime(options["delivery_day"]).floor("D"))
             if start_day not in set(self.valid_days.tolist()):
                 raise ValueError("Requested delivery_day not in valid_days.")
             start_pos = self.day_pos[start_day]
         else:
-            max_start = max(len(self.valid_days) - self.episode_days, 1)
-            start_pos = int(self.np_random.integers(0, max_start))
+            # Sample randomly within the active split (train/val/test)
+            max_start = max(len(self.active_valid_days) - self.episode_days, 1)
+            local_pos = int(self.np_random.integers(0, max_start))
+            start_pos = self.day_pos[self.active_valid_days[local_pos]]
 
         self.current_day = self.valid_days[start_pos]
         self.current_day_idxs = self.day_indices[self.current_day]

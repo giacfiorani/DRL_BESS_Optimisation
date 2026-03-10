@@ -18,3 +18,23 @@ results/trained_models/
 agents/DQN_practice.py
 agents/agent.py
 agents/agent_config.py
+
+.claude/
+# Sensitive API configs
+data/eikon.cfg
+
+#Not useful
+data/visualise_data.ipynb
+
+# Heavy ML artifacts (Match your actual folder names)
+model/
+runs/
+*.pth
+
+# Large data files
+data/*.parquet
+data/training_data.parquet
+
+# Specific unwanted files
+master_prompt.md
+roadmap.md

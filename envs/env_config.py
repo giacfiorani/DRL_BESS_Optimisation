@@ -1,7 +1,7 @@
 import numpy as np
 from pathlib import Path
 import pandas as pd
-import reward_scaling
+from envs import reward_scaling
 
 # ====
 # Load Whole dataset dataframe
@@ -43,10 +43,10 @@ eff_ch = 0.99  # Charge efficiency (η_charge = 0.99)
 self_dis = 0.0  # Self-discharge rate per timestep (set to 0 for simplicity)
 
 # ======
-# DEGRADATION MODEL PARAMETERS
+# DEGRADATION MODEL PARAMETERS — Cortés-Arcos et al. (2020) Eq. 23
+# κ = C_bat / E_lifetime (£/MWh throughput)
 # ======
 deg_kappa = 25.0
-deg_alpha = 4.0
 
 # ========
 # POWER AND TIMING PARAMETERS
@@ -66,6 +66,14 @@ n_power_levels = 11
 #reward scaling values
 S_profit = reward_scaling.S_profit
 S_carbon_gbp= reward_scaling.S_carbon_gbp
+
+# =======
+# OBSERVATION SCALING
+# =======
+
+S_price = reward_scaling.S_price
+S_ci    = reward_scaling.S_ci
+
 
 # ========
 # OCV LOOKUP TABLE (The DC OCV-SOC Curve from Spec Sheet @25°C)
