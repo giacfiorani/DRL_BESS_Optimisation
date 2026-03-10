@@ -43,10 +43,10 @@ eff_ch = 0.99  # Charge efficiency (η_charge = 0.99)
 self_dis = 0.0  # Self-discharge rate per timestep (set to 0 for simplicity)
 
 # ======
-# DEGRADATION MODEL PARAMETERS
+# DEGRADATION MODEL PARAMETERS — Cortés-Arcos et al. (2020) Eq. 23
+# κ = C_bat / E_lifetime (£/MWh throughput)
 # ======
 deg_kappa = 25.0
-deg_alpha = 4.0
 
 # ========
 # POWER AND TIMING PARAMETERS

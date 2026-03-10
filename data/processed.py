@@ -17,7 +17,7 @@ from eikon_rics_lists import DA_HH_RICS
 # Config
 # -----------------------
 START = "2022-01-01"
-END   = "2024-01-01"
+END   = "2026-01-01"
 
 ROOT = Path(__file__).resolve().parents[1]
 OUT_PATH = ROOT / "data" / "training_data.parquet"

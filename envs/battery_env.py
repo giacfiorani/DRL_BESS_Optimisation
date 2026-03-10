@@ -3,7 +3,7 @@ import pandas as pd
 import numpy as np
 from gymnasium import Env, spaces
 from pathlib import Path
-from envs.degradation import SocWeightedDegradation #import degradation class
+from envs.degradation import ThroughputDegradation
 
 class BatteryEnv(Env):
 
@@ -33,14 +33,17 @@ class BatteryEnv(Env):
 
     def __init__(
         self,
-        config, # if different configurations want to be included 
+        config,
         publish_hour: int = 12,
         episode_days: int = 30,
         randomize_init_soc: bool = True,
-        lambda_ci: float | None= None,
-        init_soc_low: float = 0.3,   # if None -> use SoC_min
-        init_soc_high: float = 0.7,  # if None -> use SoC_max
+        lambda_ci: float | None = None,
+        init_soc_low: float = 0.3,
+        init_soc_high: float = 0.7,
         seed: int | None = None,
+        split: str = "train",       # "train" | "val" | "test"
+        train_ratio: float = 0.70,
+        val_ratio: float = 0.15,
     ):
         # env initialisation
         super().__init__()
@@ -99,10 +102,9 @@ class BatteryEnv(Env):
 
         #Degradation parameters
         self.deg_kappa = float(config.deg_kappa)
-        self.deg_alpha = float(config.deg_alpha)
 
-        # Instantiate Degradation Model
-        self.degradation_model = SocWeightedDegradation(self.deg_kappa, self.deg_alpha)
+        # Instantiate Degradation Model — Cortés-Arcos et al. (2020) Eq. 23
+        self.degradation_model = ThroughputDegradation(self.deg_kappa)
 
         # ========
         # Read from OCV Lookup Table and Interpolate to get OCV-SOC Curve
@@ -178,6 +180,25 @@ class BatteryEnv(Env):
         self.valid_days = np.array(sorted(valid_days), dtype="datetime64[D]")
         self.day_indices = day_indices
         self.day_pos = {d: i for i, d in enumerate(self.valid_days)}
+
+        # ========
+        # Chronological 70 / 15 / 15 train / val / test split
+        # Never shuffle — this is time-series data.
+        # ========
+        n = len(self.valid_days)
+        n_train = int(n * train_ratio)
+        n_val   = int(n * val_ratio)
+        self.valid_days_train = self.valid_days[:n_train]
+        self.valid_days_val   = self.valid_days[n_train : n_train + n_val]
+        self.valid_days_test  = self.valid_days[n_train + n_val :]
+
+        _split_map = {"train": self.valid_days_train,
+                      "val":   self.valid_days_val,
+                      "test":  self.valid_days_test}
+        if split not in _split_map:
+            raise ValueError(f"split must be 'train', 'val', or 'test'. Got: {split!r}")
+        self.split = split
+        self.active_valid_days = _split_map[split]
 
         # ========
         # 3) ACTION SPACE
@@ -488,9 +509,6 @@ class BatteryEnv(Env):
         P_applied_MW, I_applied, V_oc_pack = self._apply_soc_protection(P_req_MW, self.soc)
 
         
-        # Capture starting SoC for the degradation penalty
-        starting_soc = self.soc
-
         # --- SoC update ---
         if I_applied < 0.0:
             delta_soc = -(I_applied * self.dt_seconds / self.Q_pack_C) * self.eta_ch
@@ -517,7 +535,7 @@ class BatteryEnv(Env):
         E_plan_MWh = P_plan_MW * self.dt_hours
         E_dev_MWh  = P_dev_MW  * self.dt_hours
 
-        # DEGRADATION MODEL
+        # DEGRADATION COST — Cortés-Arcos et al. (2020) Eq. 23
         deg_cost = self.degradation_model.calculate_costs(P_act_MW, dt_hours=self.dt_hours)
 
         # Raw profits (£)
@@ -642,15 +660,17 @@ class BatteryEnv(Env):
         self.p_prev = 0.0
         self.days_done = 0
 
-        # Choose starting day (enough room to run episode_days)
+        # Choose starting day within the active split, with enough room for episode_days
         if options is not None and options.get("delivery_day") is not None:
             start_day = np.datetime64(pd.to_datetime(options["delivery_day"]).floor("D"))
             if start_day not in set(self.valid_days.tolist()):
                 raise ValueError("Requested delivery_day not in valid_days.")
             start_pos = self.day_pos[start_day]
         else:
-            max_start = max(len(self.valid_days) - self.episode_days, 1)
-            start_pos = int(self.np_random.integers(0, max_start))
+            # Sample randomly within the active split (train/val/test)
+            max_start = max(len(self.active_valid_days) - self.episode_days, 1)
+            local_pos = int(self.np_random.integers(0, max_start))
+            start_pos = self.day_pos[self.active_valid_days[local_pos]]
 
         self.current_day = self.valid_days[start_pos]
         self.current_day_idxs = self.day_indices[self.current_day]
