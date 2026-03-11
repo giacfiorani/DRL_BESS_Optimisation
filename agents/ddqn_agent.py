@@ -1,9 +1,5 @@
 import torch as T
 import numpy as np
-import random
-from collections import deque
-
-from torch.nn.functional import smooth_l1_loss
 from agents.networks import DeepQNetwork
 from agents.replay_buffer import ReplayBuffer
 import copy
@@ -56,68 +52,55 @@ class DDQNAgent():
         return action
 
     def learn(self):
-        # 1. Only start learning if we have enough memory
         if len(self.memory) < self.batch_size:
             return None, None, None
-        
-        # 2. Reset the otpimiser gradients to zero - should we?
+
         self.Q_eval.optimiser.zero_grad()
 
-        # 3. Sample a batch from ReplayBuffer
-        states, actions, rewards, states_, dones =  self.memory.sample_batch(self.batch_size)
-        
-        # 4. Convert NumPy arrays to Tensors and move to device
-        # Tensors
-        states = T.tensor(states, dtype=T.float32).to(self.Q_eval.device)
+        states, actions, rewards, states_, dones = self.memory.sample_batch(self.batch_size)
+
+        states  = T.tensor(states,  dtype=T.float32).to(self.Q_eval.device)
         actions = T.tensor(actions, dtype=T.int64).to(self.Q_eval.device)
         rewards = T.tensor(rewards, dtype=T.float32).to(self.Q_eval.device)
         states_ = T.tensor(states_, dtype=T.float32).to(self.Q_eval.device)
-        dones = T.tensor(dones, dtype=T.bool).to(self.Q_eval.device)
-        
-        # Predicted Q-values for actions actually taken (current states)
-        q_eval = self.Q_eval.forward(states)
-        q_pred = q_eval.gather(1, actions.unsqueeze(-1)).squeeze(-1)
+        dones   = T.tensor(dones,   dtype=T.bool).to(self.Q_eval.device)
 
-        # DDQN: eval network selects best action, target network evaluates it
-        best_actions = self.Q_eval.forward(states_).argmax(dim=1)
-        q_next = self.Q_target.forward(states_).detach()
-        q_target_values = q_next.gather(1, best_actions.unsqueeze(-1)).squeeze(-1)
+        # Predicted Q for actions taken — needs grad
+        q_eval = self.Q_eval.forward(states)                              # [B, n_actions]
+        q_pred = q_eval.gather(1, actions.unsqueeze(1)).squeeze(1)        # [B]
 
-        # Mask the target if the episode is done
-        expected_q_values = rewards + self.gamma * q_target_values * (~dones).float()
+        # DDQN target — NO grad (pure target computation)
+        with T.no_grad():
+            best_actions   = self.Q_eval.forward(states_).argmax(dim=1)           # [B]
+            q_next         = self.Q_target.forward(states_)                        # [B, n_actions]
+            q_target_values = q_next.gather(1, best_actions.unsqueeze(1)).squeeze(1)  # [B]  ← KEY FIX
 
-        #compute Loss Function
+        # Bellman — all tensors are now [B], no broadcasting
+        expected_q_values = rewards + self.gamma * q_target_values * (~dones).float()  # [B]
+
         loss = self.Q_eval.loss(q_pred, expected_q_values)
-
-        # optimise the model
         loss.backward()
 
-        # Capture pre-clip grad norm (tells you when gradients were exploding)
-        total_norm = 0.0
-        for p in self.Q_eval.parameters():
-            if p.grad is not None:
-                total_norm += p.grad.data.norm(2).item() ** 2
-        grad_norm = total_norm ** 0.5
+        total_norm = sum(p.grad.data.norm(2).item() ** 2
+                        for p in self.Q_eval.parameters() if p.grad is not None) ** 0.5
 
         T.nn.utils.clip_grad_norm_(self.Q_eval.parameters(), max_norm=10.0)
         self.Q_eval.optimiser.step()
 
-        # Mean max Q-valuye over the batch (proxy for value estimate health)
         with T.no_grad():
             q_mean = q_eval.max(dim=1)[0].mean().item()
 
-        # Epsilon decay logic
         if self.epsilon > self.eps_min:
             self.epsilon -= self.eps_dec
         else:
             self.epsilon = self.eps_min
 
-        # Target network update
         self.learn_step_counter += 1
         if self.learn_step_counter % self.target_update_frequency == 0:
             self.Q_target.load_state_dict(self.Q_eval.state_dict())
 
-        return loss.item(), grad_norm, q_mean
+        return loss.item(), total_norm, q_mean
+
 
 
 
