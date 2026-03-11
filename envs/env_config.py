@@ -1,13 +1,13 @@
 import numpy as np
 from pathlib import Path
 import pandas as pd
-from envs import reward_scaling
+import envs.reward_scaling
 
 # ====
 # Load Whole dataset dataframe
 # === 
 ROOT_DIR = Path(__file__).resolve().parents[1] if "__file__" in globals() else Path.cwd().parents[0]
-DATA_PATH = ROOT_DIR / "data" / "training_data.parquet"
+DATA_PATH = ROOT_DIR / "data" / "data.parquet"
 df = pd.read_parquet(DATA_PATH).copy()
 
 
@@ -43,10 +43,16 @@ eff_ch = 0.99  # Charge efficiency (η_charge = 0.99)
 self_dis = 0.0  # Self-discharge rate per timestep (set to 0 for simplicity)
 
 # ======
-# DEGRADATION MODEL PARAMETERS — Cortés-Arcos et al. (2020) Eq. 23
-# κ = C_bat / E_lifetime (£/MWh throughput)
+# DEGRADATION MODEL PARAMETERS — Cortés-Arcos et al. (2020) Eq. 23, Version 2 Cyclic
+# κ = Cost_bat / Q_lifetime_MWh  [£/MWh]
+# Derivation:
+#   Cost_bat      = £200/kWh × 372.7 kWh = £74,540
+#   N_cycles      = 3,500 (CATL EnerOne datasheet, 1C to 80% capacity)
+#   DoD           = 0.80  (SoC_min=0.1, SoC_max=0.9)
+#   Q_lifetime    = 3500 × 2 × 0.80 × 372.7 kWh / 1000 = 2,087 MWh (bidirectional)
+#   κ             = £74,540 / 2,087 = £35.7/MWh → 35.0 £/MWh
 # ======
-deg_kappa = 25.0
+deg_kappa = 35.0
 
 # ========
 # POWER AND TIMING PARAMETERS
@@ -64,15 +70,15 @@ lambda_ci = 0.9  # Carbon penalty weight (λ) - tunable scalar
 n_power_levels = 11 
 
 #reward scaling values
-S_profit = reward_scaling.S_profit
-S_carbon_gbp= reward_scaling.S_carbon_gbp
+S_profit = envs.reward_scaling.S_profit
+S_carbon_gbp= envs.reward_scaling.S_carbon_gbp
 
 # =======
 # OBSERVATION SCALING
 # =======
 
-S_price = reward_scaling.S_price
-S_ci    = reward_scaling.S_ci
+S_price = envs.reward_scaling.S_price
+S_ci    = envs.reward_scaling.S_ci
 
 
 # ========

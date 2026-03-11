@@ -4,7 +4,7 @@ import pandas as pd
 import envs.env_config
 
 ROOT_DIR = Path(__file__).resolve().parents[1] if "__file__" in globals() else Path.cwd().parents[0]
-DATA_PATH = ROOT_DIR / "data" / "training_data.parquet"
+DATA_PATH = ROOT_DIR / "data" / "data.parquet"
 df = pd.read_parquet(DATA_PATH).copy()
 
 # Battery step magnitude (worst-case)
@@ -19,16 +19,11 @@ E_step_kWh = E_step_MWh * 1000.0
 # REWARD SCALING
 #=====
 
-# --- Max Degradation Magnitude ---
-deg_kappa = 25.0
-deg_alpha = 4.0
+# --- Max Degradation Magnitude — Cortés-Arcos et al. (2020) Eq. 23 ---
+# Read from env_config so kappa is defined in exactly one place
+deg_kappa = 35
+max_deg_cost = deg_kappa * E_step_MWh
 
-# The worst-case SoC is 1.0 (or 0.0), which maximizes the quadratic penalty
-worst_case_soc = 1.0
-max_stress_multiplier = 1.0 + deg_alpha * (worst_case_soc - 0.5)**2 
-
-# Calculate the maximum possible degradation cost in a single step
-max_deg_cost = deg_kappa * E_step_MWh * max_stress_multiplier
 # ---- PROFIT scale (DA+ID combined) ----
 da_abs  = df["da_price_gbp_mwh"].astype(float).abs().to_numpy()
 mid_abs = df["mid_price_gbp_mwh"].astype(float).abs().to_numpy()

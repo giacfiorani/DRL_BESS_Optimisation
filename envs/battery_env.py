@@ -119,7 +119,7 @@ class BatteryEnv(Env):
         # The agent steps forward in delivery_ts, not trade_ts
 
         ROOT_DIR = Path(__file__).resolve().parents[1]
-        DATA_PATH = ROOT_DIR / "data" / "training_data.parquet"
+        DATA_PATH = ROOT_DIR / "data" / "data.parquet"
         df = pd.read_parquet(DATA_PATH).copy()
 
         df["trade_ts"] = pd.to_datetime(df["trade_ts"])
@@ -350,13 +350,13 @@ class BatteryEnv(Env):
     # ========
 
     def _publish_ts_for_delivery_day(self, delivery_day: np.datetime64) -> np.datetime64:
+
         """
+        Pure NumPy (lightning fast) time math.
         DA for a delivery day D is assumed published at (D-1) at publish_hour.
-        delivery_day is date at midnight (dtype datetime64[ns]).
         """
-        d = pd.Timestamp(delivery_day).floor("D")
-        publish = (d - pd.Timedelta(days=1)) + pd.Timedelta(hours=self.publish_hour)
-        return np.datetime64(publish)
+        # Subtract 1 day, add the publish hours
+        return delivery_day.astype('datetime64[D]') - np.timedelta64(1, 'D') + np.timedelta64(self.publish_hour, 'h')
 
     # check if Day Ahead (DA) prices are published
     def _da_available_now(self, idx: int) -> bool:
@@ -376,8 +376,7 @@ class BatteryEnv(Env):
 
     def _get_tomorrow_day_from_delivery_ts(self, idx: int) -> np.datetime64:
         now = self.delivery_ts[idx]
-        tomorrow = pd.Timestamp(now).floor("D") + pd.Timedelta(days=1)
-        return np.datetime64(tomorrow.date(), "D")
+        return now.astype('datetime64[D]') + np.timedelta64(1, 'D')
 
     def _get_tomorrow_da_curve(self, idx: int) -> np.ndarray:
         tomorrow_day = self._get_tomorrow_day_from_delivery_ts(idx)

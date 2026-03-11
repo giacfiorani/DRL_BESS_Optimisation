@@ -17,12 +17,12 @@ from utils.action_encoding import encode, decode, N_ACTIONS
 HYPERPARAMS = {
     "gamma":        0.99,
     "epsilon":      1.0,
-    "lr":           1e-4,
+    "lr":           1e-5,
     "batch_size":   64,
-    "eps_dec":      1e-5,
+    "eps_dec":      5e-5,
     "eps_min":      0.01,
     "lambda_ci":    0.9,   # 0 = profit only, 1 = equal weight
-    "n_episodes":   100,
+    "n_episodes":   500,
     "episode_days": 30,
 }
 
@@ -30,10 +30,10 @@ HYPERPARAMS = {
 env_config = envs.env_config
 
 def train():
-    run_name = (f"DQN_lci{HYPERPARAMS['lambda_ci']}_lr{HYPERPARAMS['lr']}"
-                f"_g{HYPERPARAMS['gamma']}_eps{HYPERPARAMS['n_episodes']}")
+    run_name = (f"02_DQN_lci{HYPERPARAMS['lambda_ci']}_lr{HYPERPARAMS['lr']}"
+                f"_g{HYPERPARAMS['gamma']}_eps{HYPERPARAMS['n_episodes']}_train70")
     writer = SummaryWriter(f"runs/{run_name}")
-    env = BatteryEnv(config=env_config, lambda_ci=HYPERPARAMS["lambda_ci"])
+    env = BatteryEnv(config=env_config, lambda_ci=HYPERPARAMS["lambda_ci"], split="train")
 
     agent = DQNAgent(
         gamma       = HYPERPARAMS["gamma"],
@@ -108,17 +108,17 @@ def train():
                 ep_grad_norms.append(grad_norm)
                 ep_q_means.append(q_mean)
 
-            if info["P_applied_MW"] < 1e-4:
+            if abs(info["P_applied_MW"]) < 1e-4:
                 ep_idle_steps += 1
 
             # Step-level (log every step — useful first few episodes, then comment out)
-            writer.add_scalar("Step/SoC",           info["soc"],          global_step)
-            writer.add_scalar("Step/P_requested",   info["P_req_MW"],     global_step)
-            writer.add_scalar("Step/P_applied",     info["P_applied_MW"], global_step)
-            writer.add_scalar("Step/DA_Price",      info["da_price_now"], global_step)
-            writer.add_scalar("Step/ID_Price",      info["id_price_now"], global_step)
-            writer.add_scalar("Step/CI",            info["ci_now"],       global_step)
-            writer.add_scalar("Step/DA_Available",  float(info["da_available"]), global_step)
+            # writer.add_scalar("Step/SoC",           info["soc"],          global_step)
+            # writer.add_scalar("Step/P_requested",   info["P_req_MW"],     global_step)
+            # writer.add_scalar("Step/P_applied",     info["P_applied_MW"], global_step)
+            # writer.add_scalar("Step/DA_Price",      info["da_price_now"], global_step)
+            # writer.add_scalar("Step/ID_Price",      info["id_price_now"], global_step)
+            # writer.add_scalar("Step/CI",            info["ci_now"],       global_step)
+            # writer.add_scalar("Step/DA_Available",  float(info["da_available"]), global_step)
 
             global_step += 1
             obs = obs_
