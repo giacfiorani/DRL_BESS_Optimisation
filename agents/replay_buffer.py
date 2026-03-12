@@ -17,11 +17,11 @@ class ReplayBuffer:
         # the batch needs to be seperated back into individual arrays
         states, actions, rewards, next_states, dones = zip(*batch)
 
-        return(np.array(states, dtype=np.float32),
-        np.array(actions, dtype=np.int64), # Changed to int64 for PyTorch compatibility
-        np.array(rewards, dtype=np.float32),
-        np.array(next_states, dtype=np.float32),
-        np.array(dones, dtype=np.bool_))
+        return(np.array(states,      dtype=np.float32),
+               np.array(actions,     dtype=np.int64),
+               np.array(rewards,     dtype=np.float32).reshape(-1),
+               np.array(next_states, dtype=np.float32),
+               np.array(dones,       dtype=np.bool_).reshape(-1))
     
     def __len__(self):
         return len(self.memory)

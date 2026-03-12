@@ -29,7 +29,7 @@ class DQNAgent():
         self.Q_eval = DeepQNetwork(self.lr, n_actions=self.n_actions, input_dims=self.input_dims, fc1_dims=256, fc2_dims=256)
         self.Q_target = copy.deepcopy(self.Q_eval)
         self.learn_step_counter = 0
-        self.target_update_frequency = 1000 #update target every 1000 steps.
+        self.target_update_frequency = 5000 #update target every 5000 steps.
 
 
         #call the replay buffer 
@@ -69,24 +69,26 @@ class DQNAgent():
         # 4. Convert NumPy arrays to Tensors and move to device
         # Tensors
         states = T.tensor(states, dtype=T.float32).to(self.Q_eval.device)
-        actions = T.tensor(actions, dtype=T.int64).to(self.Q_eval.device)
-        rewards = T.tensor(rewards, dtype=T.float32).to(self.Q_eval.device)
+        actions = T.tensor(actions, dtype=T.int64).to(self.Q_eval.device).view(-1)
+        rewards = T.tensor(rewards, dtype=T.float32).to(self.Q_eval.device).view(-1)
         states_ = T.tensor(states_, dtype=T.float32).to(self.Q_eval.device)
-        dones = T.tensor(dones, dtype=T.bool).to(self.Q_eval.device)
+        dones = T.tensor(dones, dtype=T.bool).to(self.Q_eval.device).view(-1)
         
         # Predicted Q-values for the actions we actually took
         q_eval = self.Q_eval.forward(states)
-        q_pred = q_eval.gather(1, actions.unsqueeze(-1)).squeeze(-1)
+        q_pred = q_eval.gather(1, actions.unsqueeze(1)).squeeze(1)
         
         # Target Q-values (The Bellman Equation)
         q_next = self.Q_target.forward(states_).detach()
         max_q_next = T.max(q_next, dim=1)[0]
 
         # Mask the target if the episode is done
-        q_target = rewards + self.gamma * max_q_next * (~dones).float()
+        expected_q_values = rewards + self.gamma * max_q_next * (~dones).float()
 
+        assert q_pred.shape == expected_q_values.shape, \
+            f"Shape mismatch before loss: q_pred={q_pred.shape}, expected={expected_q_values.shape}"
         #compute Loss Function
-        loss = self.Q_eval.loss(q_pred, q_target)
+        loss = self.Q_eval.loss(q_pred, expected_q_values)
 
         # optimise the model
         loss.backward()

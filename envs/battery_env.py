@@ -35,7 +35,7 @@ class BatteryEnv(Env):
         self,
         config,
         publish_hour: int = 12,
-        episode_days: int = 30,
+        episode_days: int = 7,
         randomize_init_soc: bool = True,
         lambda_ci: float | None = None,
         init_soc_low: float = 0.3,

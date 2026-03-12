@@ -25,7 +25,7 @@ class DDQNAgent():
         self.Q_eval = DeepQNetwork(self.lr, n_actions=self.n_actions, input_dims=self.input_dims, fc1_dims=256, fc2_dims=256)
         self.Q_target = copy.deepcopy(self.Q_eval)
         self.learn_step_counter = 0
-        self.target_update_frequency = 500 #update target every 500 steps.
+        self.target_update_frequency = 5000 #update target every 5000 steps.
 
 
         #call the replay buffer 
@@ -60,10 +60,10 @@ class DDQNAgent():
         states, actions, rewards, states_, dones = self.memory.sample_batch(self.batch_size)
 
         states  = T.tensor(states,  dtype=T.float32).to(self.Q_eval.device)
-        actions = T.tensor(actions, dtype=T.int64).to(self.Q_eval.device)
-        rewards = T.tensor(rewards, dtype=T.float32).to(self.Q_eval.device)
+        actions = T.tensor(actions, dtype=T.int64).to(self.Q_eval.device).view(-1)
+        rewards = T.tensor(rewards, dtype=T.float32).to(self.Q_eval.device).view(-1)
         states_ = T.tensor(states_, dtype=T.float32).to(self.Q_eval.device)
-        dones   = T.tensor(dones,   dtype=T.bool).to(self.Q_eval.device)
+        dones   = T.tensor(dones,   dtype=T.bool).to(self.Q_eval.device).view(-1)
 
         # Predicted Q for actions taken — needs grad
         q_eval = self.Q_eval.forward(states)                              # [B, n_actions]
@@ -73,11 +73,14 @@ class DDQNAgent():
         with T.no_grad():
             best_actions   = self.Q_eval.forward(states_).argmax(dim=1)           # [B]
             q_next         = self.Q_target.forward(states_)                        # [B, n_actions]
-            q_target_values = q_next.gather(1, best_actions.unsqueeze(1)).squeeze(1)  # [B]  ← KEY FIX
+            q_target_values = q_next.gather(1, best_actions.unsqueeze(1)).squeeze(1)  # [B] 
+        
 
         # Bellman — all tensors are now [B], no broadcasting
         expected_q_values = rewards + self.gamma * q_target_values * (~dones).float()  # [B]
 
+        assert q_pred.shape == expected_q_values.shape, \
+            f"Shape mismatch before loss: q_pred={q_pred.shape}, expected={expected_q_values.shape}"
         loss = self.Q_eval.loss(q_pred, expected_q_values)
         loss.backward()
 

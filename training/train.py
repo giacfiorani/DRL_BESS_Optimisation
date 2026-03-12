@@ -19,12 +19,12 @@ from utils.action_encoding import decode, N_ACTIONS
 HYPERPARAMS = {
     "gamma":        0.99,
     "epsilon":      1.0,
-    "lr":           1e-4,
+    "lr":           1e-5,
     "batch_size":   128,
-    "eps_dec":      1e-6,
+    "eps_dec":      5e-6,
     "eps_min":      0.01,
     "lambda_ci":    0.9,   # 0 = profit only, 1 = equal weight
-    "n_episodes":   1000,
+    "n_episodes":   500,
 }
 
 # ============================================================
@@ -162,6 +162,7 @@ def train(agent_name: str, run_id: int):
         writer.add_scalar("Dispatch/Mean_Applied_MW",      np.mean(p_app),  i)
         writer.add_scalar("Dispatch/Mean_Deviation_MW",    np.mean(p_dev),  i)
         writer.add_scalar("Dispatch/SoC_Shield_Activation", ep_clip_events, i)
+        writer.add_scalar("Dispatch/Idle_Steps_per_Episode", ep_idle_steps, i)
         writer.add_histogram("Dispatch/P_Applied_Dist",    p_app,           i)
 
         # 3. SoC Health
