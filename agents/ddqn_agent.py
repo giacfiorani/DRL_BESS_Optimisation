@@ -15,12 +15,8 @@ class DDQNAgent():
         self.n_actions = n_actions
         self.input_dims = input_dims
         self.batch_size = batch_size
-        self.mem_size = max_mem_size
-        self.action_space =  [i for i in range(self.n_actions)]
         self.eps_dec = eps_dec
         self.eps_min = eps_min
-        self.mem_cntr = 0 # memory counter to keep track of the first available memory point
-        
 
         self.Q_eval = DeepQNetwork(self.lr, n_actions=self.n_actions, input_dims=self.input_dims, fc1_dims=256, fc2_dims=256)
         self.Q_target = copy.deepcopy(self.Q_eval)
@@ -28,8 +24,7 @@ class DDQNAgent():
         self.target_update_frequency = 5000 #update target every 5000 steps.
 
 
-        #call the replay buffer 
-        self.memory = ReplayBuffer(max_size=max_mem_size)
+        self.memory = ReplayBuffer(max_size=max_mem_size, obs_dim=input_dims)
 
     def store_transition(self, state, action, reward, next_state, done):
         self.memory.add_experience(state, action, reward, next_state, done)
@@ -40,15 +35,11 @@ class DDQNAgent():
             action = np.random.randint(self.n_actions)
         else:
             # EXPLOIT: Use the brain
-            self.Q_eval.eval()
             with T.no_grad():
-                # 1. Convert to tensor, move to GPU/CPU, add batch dimension
-                state = T.tensor(observation, dtype=T.float32).to(self.Q_eval.device).unsqueeze(0)
-                # 2. Get the Q-values (predictions)
+                # Zero-copy: from_numpy shares memory when obs is already float32 C-contiguous
+                state = T.from_numpy(np.asarray(observation, dtype=np.float32)).to(self.Q_eval.device).unsqueeze(0)
                 q_values = self.Q_eval.forward(state)
-                # 3. Find the index of the highest prediction
-                action = T.argmax(q_values, dim=1).item() # we could remove the dim=1
-            self.Q_eval.train()
+                action = T.argmax(q_values, dim=1).item()
         return action
 
     def learn(self):
@@ -59,11 +50,14 @@ class DDQNAgent():
 
         states, actions, rewards, states_, dones = self.memory.sample_batch(self.batch_size)
 
-        states  = T.tensor(states,  dtype=T.float32).to(self.Q_eval.device)
-        actions = T.tensor(actions, dtype=T.int64).to(self.Q_eval.device).view(-1)
-        rewards = T.tensor(rewards, dtype=T.float32).to(self.Q_eval.device).view(-1)
-        states_ = T.tensor(states_, dtype=T.float32).to(self.Q_eval.device)
-        dones   = T.tensor(dones,   dtype=T.bool).to(self.Q_eval.device).view(-1)
+        # as_tensor is zero-copy when the numpy array dtype already matches (float32/int64/bool)
+        # and the array is C-contiguous (guaranteed by the ring buffer's fancy-index slices)
+        device  = self.Q_eval.device
+        states  = T.as_tensor(states,   dtype=T.float32).to(device)
+        actions = T.as_tensor(actions,  dtype=T.int64).to(device)
+        rewards = T.as_tensor(rewards,  dtype=T.float32).to(device)
+        states_ = T.as_tensor(states_,  dtype=T.float32).to(device)
+        dones   = T.as_tensor(dones,    dtype=T.bool).to(device)
 
         # Predicted Q for actions taken — needs grad
         q_eval = self.Q_eval.forward(states)                              # [B, n_actions]
@@ -103,10 +97,3 @@ class DDQNAgent():
             self.Q_target.load_state_dict(self.Q_eval.state_dict())
 
         return loss.item(), total_norm, q_mean
-
-
-
-
-
-
-        

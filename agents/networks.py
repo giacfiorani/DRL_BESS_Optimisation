@@ -2,21 +2,16 @@ import torch as T
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-import numpy as np
-import os 
+import os
 
 class DeepQNetwork(nn.Module):
     def __init__(self, lr, input_dims, fc1_dims, fc2_dims, n_actions):
         super(DeepQNetwork, self).__init__()
-        self.input_dims = input_dims 
-        self.fc1_dims = fc1_dims 
-        self.fc2_dims = fc2_dims 
-        self.n_actions = n_actions 
-        
+
         # Neural Network layers
-        self.fc1 = nn.Linear(self.input_dims, self.fc1_dims)
-        self.fc2 = nn.Linear(self.fc1_dims, self.fc2_dims)
-        self.fc3 = nn.Linear(self.fc2_dims, self.n_actions)
+        self.fc1 = nn.Linear(input_dims, fc1_dims)
+        self.fc2 = nn.Linear(fc1_dims, fc2_dims)
+        self.fc3 = nn.Linear(fc2_dims, n_actions)
 
         # Optimizer 
         self.optimiser = optim.Adam(self.parameters(), lr=lr)

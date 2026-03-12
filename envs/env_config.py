@@ -61,11 +61,6 @@ C_rate = 0.5  # C-rate (0.5C = 2-hour discharge)
 P_max_MW = C_rate * E_max  # MW (power step: P_step = 0.5C × E_nominal = 0.18635 MW)
 dt = 0.5  # hours (timestep = 30 minutes)
 
-# ========
-# REWARD FUNCTION PARAMETERS
-# ========
-lambda_ci = 0.9  # Carbon penalty weight (λ) - tunable scalar
-
 # For discrete action space, we need to define the number of power levels
 n_power_levels = 11 
 

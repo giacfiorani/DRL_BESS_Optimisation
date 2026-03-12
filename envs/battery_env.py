@@ -84,7 +84,7 @@ class BatteryEnv(Env):
         self.n_power_levels = config.n_power_levels
 
         # Reward config: carbon weight λ
-        self.lambda_ci = float(lambda_ci if lambda_ci is not None else config.lambda_ci)
+        self.lambda_ci = lambda_ci
         
         # ECM R-int model parameter (internal resistance)
         self.R_cell_mOhm = config.R_cell_mOhm  # mΩ per cell
@@ -144,6 +144,12 @@ class BatteryEnv(Env):
         self.ci_forecast = df["ci_forecast_gco2_kwh"].to_numpy(dtype=np.float32) # forecaste Carbon intensity data
         self.mef = df["mef_gco2_kwh"].to_numpy(dtype=np.float32) # Marginal Emissions Factor data
         self.carbon_price = df["uka_gbp_tco2"].to_numpy(dtype=np.float32) # carbon price
+
+
+        # Precomputed Datetime Arrays
+        self.tomorrow_day_arr = self.delivery_date.astype('datetime64[D]') + np.timedelta64(1, 'D')
+        publish_ts_arr = self.tomorrow_day_arr - np.timedelta64(1,'D') + np.timedelta64(self.publish_hour, 'h')
+        self.da_avail_arr = (self.delivery_ts >= publish_ts_arr)
 
         #====
         # Group environment episodes by DELIVERY day (not trade day):
@@ -348,15 +354,9 @@ class BatteryEnv(Env):
     # ========
     # DA availability + tomorrow curve
     # ========
-
-    def _publish_ts_for_delivery_day(self, delivery_day: np.datetime64) -> np.datetime64:
-
-        """
-        Pure NumPy (lightning fast) time math.
-        DA for a delivery day D is assumed published at (D-1) at publish_hour.
-        """
-        # Subtract 1 day, add the publish hours
-        return delivery_day.astype('datetime64[D]') - np.timedelta64(1, 'D') + np.timedelta64(self.publish_hour, 'h')
+    
+    def _get_tomorrow_day_from_delivery_ts(self, idx: int) -> np.datetime64:
+        return self.tomorrow_day_arr[idx]
 
     # check if Day Ahead (DA) prices are published
     def _da_available_now(self, idx: int) -> bool:
@@ -364,19 +364,12 @@ class BatteryEnv(Env):
         At decision time = current delivery_ts, do we have tomorrow's DA curve?
         DA for delivery day D is published at (D-1) publish_hour.
         """
-        now = self.delivery_ts[idx]
-        tomorrow_day = self._get_tomorrow_day_from_delivery_ts(idx)
-        publish_ts = self._publish_ts_for_delivery_day(tomorrow_day)
-        return now >= publish_ts
+        return bool(self.da_avail_arr[idx])
 
     # Retrieve DA prices for all 48 sp
     def _get_da_curve_for_delivery_day(self, delivery_day: np.datetime64) -> np.ndarray:
         idxs = self.day_indices[delivery_day]
-        return self.da_price[idxs].astype(np.float32)
-
-    def _get_tomorrow_day_from_delivery_ts(self, idx: int) -> np.datetime64:
-        now = self.delivery_ts[idx]
-        return now.astype('datetime64[D]') + np.timedelta64(1, 'D')
+        return self.da_price[idxs].astype(np.float32)   
 
     def _get_tomorrow_da_curve(self, idx: int) -> np.ndarray:
         tomorrow_day = self._get_tomorrow_day_from_delivery_ts(idx)
@@ -598,10 +591,8 @@ class BatteryEnv(Env):
         obs = self._get_obs()
 
         info = {
-            #"trade_date": str(pd.Timestamp(self.trade_date[idx])),
-            #"delivery_date": str(pd.Timestamp(self.delivery_date[idx])),
            # --- Essential Timestamps / Indices ---
-            "delivery_ts": str(pd.Timestamp(self.delivery_ts[idx])),
+            "delivery_ts": str(self.delivery_ts[idx]),
             "tau": int(tau0 + 1),
             "idx": int(idx),
             "days_done": int(self.days_done),
