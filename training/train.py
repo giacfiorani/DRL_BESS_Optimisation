@@ -1,10 +1,12 @@
 import sys
 import os
 import argparse
+import random
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 import numpy as np
+import torch as T
 from torch.utils.tensorboard import SummaryWriter
 import envs.env_config
 
@@ -14,14 +16,28 @@ from envs.battery_env import BatteryEnv
 from utils.action_encoding import decode, N_ACTIONS
 
 # ============================================================
+# REPRODUCIBILITY SEED — controls ALL randomness
+# ============================================================
+SEED = 42
+
+# ============================================================
+# STEP-LEVEL MONITORING
+# Every STEP_LOG_INTERVAL episodes, every step of that episode
+# is logged under Step/ tags in TensorBoard.
+# Set to 0 to disable, or lower for denser snapshots.
+# With 336 steps/ep and interval=50 → 10 snapshots over 500 eps.
+# ============================================================
+STEP_LOG_INTERVAL = 250
+
+# ============================================================
 # HYPERPARAMETERS  —  edit here before each run
 # ============================================================
 HYPERPARAMS = {
-    "gamma":        0.99,
+    "gamma":        0.975,
     "epsilon":      1.0,
-    "lr":           1e-5,
-    "batch_size":   128,
-    "eps_dec":      8e-6,
+    "lr":           1.45e-05,
+    "batch_size":   256,
+    "eps_dec":      1.32e-04,
     "eps_min":      0.01,
     "lambda_ci":    0.9,   # 0 = profit only, 1 = equal weight
     "n_episodes":   500,
@@ -53,6 +69,13 @@ def build_agent(agent_name: str):
 
 
 def train(agent_name: str, run_id: int):
+    # ---- Freeze all randomness for reproducible debugging ---- ONLY FOR TESTING
+    random.seed(SEED)
+    np.random.seed(SEED)
+    T.manual_seed(SEED)
+    if T.backends.mps.is_available():
+        T.mps.manual_seed(SEED)
+
     run_name = (
         f"{run_id:02d}_{agent_name.upper()}"
         f"_lci{HYPERPARAMS['lambda_ci']}"
@@ -61,15 +84,24 @@ def train(agent_name: str, run_id: int):
         f"_eps{HYPERPARAMS['n_episodes']}_train70"
     )
     writer = SummaryWriter(f"runs/{run_name}")
-    env = BatteryEnv(config=env_config, lambda_ci=HYPERPARAMS["lambda_ci"], split="train")
+    env = BatteryEnv(
+        config=env_config,
+        lambda_ci=HYPERPARAMS["lambda_ci"],
+        split="train",
+        randomize_init_soc=False,   # always start at SoC_initial
+        seed=SEED,                  # pin the env's internal RNG
+    )
     agent = build_agent(agent_name)
 
     global_step = 0
     scores = []
+    log_this_episode = False   # set per episode below
 
     for i in range(HYPERPARAMS["n_episodes"]):
         obs, info = env.reset()
         done = False
+        step_in_ep = 0
+        log_this_episode = (STEP_LOG_INTERVAL > 0 and i % STEP_LOG_INTERVAL == 0)
 
         # --- Episode Accumulators ---
         ep_reward         = 0.0
@@ -115,8 +147,8 @@ def train(agent_name: str, run_id: int):
 
             # if abs(info["P_req_MW"] - info["P_applied_MW"]) > 1e-4:
             #     ep_clip_events += 1
-            # if info["da_available"] and info["tomorrow_plan_value_written"] >= 0:
-            #     ep_da_plan_edits += 1
+            if info["da_available"] and info["tomorrow_plan_value_written"] >= 0:
+                ep_da_plan_edits += 1
             if loss is not None:
                 ep_losses.append(loss)
                 ep_grad_norms.append(grad_norm)
@@ -124,14 +156,81 @@ def train(agent_name: str, run_id: int):
             if abs(info["P_applied_MW"]) < 1e-4:
                 ep_idle_steps += 1
 
-            # Step-level logging (uncomment when debugging early episodes)
-            # writer.add_scalar("Step/SoC",          info["soc"],          global_step)
-            # writer.add_scalar("Step/P_requested",  info["P_req_MW"],     global_step)
-            # writer.add_scalar("Step/P_applied",    info["P_applied_MW"], global_step)
-            # writer.add_scalar("Step/DA_Price",     info["da_price_now"], global_step)
-            # writer.add_scalar("Step/ID_Price",     info["id_price_now"], global_step)
-            # writer.add_scalar("Step/CI",           info["ci_now"],       global_step)
+            # ----------------------------------------------------------------
+            # STEP-LEVEL SNAPSHOT — logged every STEP_LOG_INTERVAL episodes.
+            # X-axis = step_in_ep (0–335). Tag prefix encodes the episode so
+            # each snapshot is its own labelled series in TensorBoard.
+            # Sanity-check expectations noted inline for each group.
+            # ----------------------------------------------------------------
+            if log_this_episode:
+                s = step_in_ep
 
+                # ── 1. Battery Physics ──────────────────────────────────────
+                # SoC       : must always stay in [SoC_min, SoC_max] (~0.10–0.90)
+                # delta_soc : bounded by P_max*dt/E_cap ≈ ±0.025 per step
+                # P_applied : |P| ≤ P_max = 0.18635 MW at all times
+                # P_req vs P_applied : differ ONLY when SoC clipping fires
+                # P_dev     = P_applied − P_planned  (intraday imbalance)
+                writer.add_scalar(f"Step_ep{i:04d}/Bat_SoC",          info["soc"],          s)
+                writer.add_scalar(f"Step_ep{i:04d}/Bat_Delta_SoC",    info["delta_soc"],    s)
+                writer.add_scalar(f"Step_ep{i:04d}/Bat_P_applied_MW", info["P_applied_MW"], s)
+                writer.add_scalar(f"Step_ep{i:04d}/Bat_P_req_MW",     info["P_req_MW"],     s)
+                writer.add_scalar(f"Step_ep{i:04d}/Bat_P_planned_MW", info["P_planned_MW"], s)
+                writer.add_scalar(f"Step_ep{i:04d}/Bat_P_dev_MW",     info["P_dev_MW"],     s)
+
+                # ── 2. Agent Decisions ──────────────────────────────────────
+                # dispatch_idx   : 0 = max-discharge, 5 = idle, 10 = max-charge
+                # planned_today  : DA plan level committed for this slot
+                # da_available   : 1 from slot 24 onward each day (window open)
+                # plan_written   : plan_idx written this step; −999 = window closed
+                writer.add_scalar(f"Step_ep{i:04d}/Act_Dispatch_idx",    info["dispatch_idx_agent"],             s)
+                writer.add_scalar(f"Step_ep{i:04d}/Act_Planned_Today",   info["planned_idx_today"],              s)
+                writer.add_scalar(f"Step_ep{i:04d}/Act_DA_Available",    float(info["da_available"]),            s)
+                writer.add_scalar(f"Step_ep{i:04d}/Act_Plan_Written",    info["tomorrow_plan_value_written"],    s)
+
+                # ── 3. Market Signals ───────────────────────────────────────
+                # DA / ID prices in £/MWh — correlated but not identical.
+                # CI in gCO2/kWh — spikes at morning/evening peaks.
+                # MEF = marginal emission factor (tCO2/MWh).
+                writer.add_scalar(f"Step_ep{i:04d}/Mkt_DA_Price",      info["da_price_now"],     s)
+                writer.add_scalar(f"Step_ep{i:04d}/Mkt_ID_Price",      info["id_price_now"],     s)
+                writer.add_scalar(f"Step_ep{i:04d}/Mkt_CI",            info["ci_now"],           s)
+                writer.add_scalar(f"Step_ep{i:04d}/Mkt_MEF",           info["mef_now"],          s)
+                writer.add_scalar(f"Step_ep{i:04d}/Mkt_Carbon_Price",  info["carbon_price_now"], s)
+
+                # ── 4. Revenue / Cost Decomposition ────────────────────────
+                # DA_GBP    = P_planned × DA_price × 0.5h  (day-ahead settlement)
+                # ID_GBP    = P_dev × ID_price × 0.5h      (intraday rebalance)
+                # Gross_GBP = DA + ID before costs
+                # Deg_GBP   > 0 always, proportional to |P_applied|
+                # Carbon    can be +/− (charging imports carbon cost; discharging exports credit)
+                # Net_GBP   = Gross − Deg − Carbon  (true per-step profit)
+                R_gross = info["Planned_Profit"] + info["Intraday_Profit"]
+                R_net   = R_gross - info["degradation_cost_gbp"] - info["carbon_cashflow"]
+                writer.add_scalar(f"Step_ep{i:04d}/Rev_DA_GBP",       info["Planned_Profit"],       s)
+                writer.add_scalar(f"Step_ep{i:04d}/Rev_ID_GBP",       info["Intraday_Profit"],      s)
+                writer.add_scalar(f"Step_ep{i:04d}/Rev_Gross_GBP",    R_gross,                      s)
+                writer.add_scalar(f"Step_ep{i:04d}/Rev_Deg_GBP",      info["degradation_cost_gbp"], s)
+                writer.add_scalar(f"Step_ep{i:04d}/Rev_Carbon_GBP",   info["carbon_cashflow"],      s)
+                writer.add_scalar(f"Step_ep{i:04d}/Rev_Net_GBP",      R_net,                        s)
+                writer.add_scalar(f"Step_ep{i:04d}/Rev_Carbon_tCO2",  info["net_carbon_tCO2"],      s)
+
+                # ── 5. Reward Construction ──────────────────────────────────
+                # profit_norm and carbon_norm are tanh-normalised → (−1, +1).
+                # reward = profit_norm − λ_ci × carbon_norm  →  (≈ −1.9, +1.9).
+                # Both norms should move together when dispatch is profitable
+                # but high-CI — that trade-off is the λ_ci penalty.
+                writer.add_scalar(f"Step_ep{i:04d}/Rew_Profit_Norm",  info["profit_norm"],         s)
+                writer.add_scalar(f"Step_ep{i:04d}/Rew_Carbon_Norm",  info["carbon_penalty_norm"], s)
+                writer.add_scalar(f"Step_ep{i:04d}/Rew_Total",        reward,                      s)
+
+                # ── 6. Episode Position ─────────────────────────────────────
+                # tau       : half-hour slot within the current day (0–47)
+                # days_done : number of complete days elapsed this episode
+                writer.add_scalar(f"Step_ep{i:04d}/Pos_Tau",       info["tau"],       s)
+                writer.add_scalar(f"Step_ep{i:04d}/Pos_Days_Done", info["days_done"], s)
+
+            step_in_ep  += 1
             global_step += 1
             obs = obs_
 
@@ -200,7 +299,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--agent",
         type=str,
-        default="ddqn",
+        default="dqn",
         choices=list(AGENTS.keys()),
         help="Agent to train: " + ", ".join(AGENTS.keys()),
     )

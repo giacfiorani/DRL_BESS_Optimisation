@@ -36,11 +36,11 @@ class BatteryEnv(Env):
         config,
         publish_hour: int = 12,
         episode_days: int = 7,
-        randomize_init_soc: bool = True,
+        randomize_init_soc: bool = False,
         lambda_ci: float | None = None,
         init_soc_low: float = 0.3,
         init_soc_high: float = 0.7,
-        seed: int | None = None,
+        seed: int | None = 42,
         split: str = "train",       # "train" | "val" | "test"
         train_ratio: float = 0.70,
         val_ratio: float = 0.15,
@@ -75,7 +75,7 @@ class BatteryEnv(Env):
         self.dt_hours = config.dt
         self.dt_seconds = self.dt_hours * 3600.0
 
-        # Efficiencies (from your MDP)
+        # Efficiencies
         self.eta_ch = config.eff_ch   # charge efficiency
         self.eta_dis = config.eff_dis    # discharge efficiency
 
@@ -624,6 +624,7 @@ class BatteryEnv(Env):
             "Planned_Profit": float(R_DA),
             "Intraday_Profit": float(R_ID),
             "degradation_cost_gbp": float(deg_cost), 
+            "carbon_cashflow": float(carbon_cashflow_gbp),
             "net_carbon_tCO2": float(net_tCO2),      
 
             # --- Neural Network Normalisation ---
@@ -658,8 +659,9 @@ class BatteryEnv(Env):
             start_pos = self.day_pos[start_day]
         else:
             # Sample randomly within the active split (train/val/test)
-            max_start = max(len(self.active_valid_days) - self.episode_days, 1)
-            local_pos = int(self.np_random.integers(0, max_start))
+            # max_start = max(len(self.active_valid_days) - self.episode_days, 1)
+            # local_pos = int(self.np_random.integers(0, max_start))
+            local_pos = 0 #harcoded non random start for verification
             start_pos = self.day_pos[self.active_valid_days[local_pos]]
 
         self.current_day = self.valid_days[start_pos]

@@ -21,7 +21,7 @@ class DDQNAgent():
         self.Q_eval = DeepQNetwork(self.lr, n_actions=self.n_actions, input_dims=self.input_dims, fc1_dims=256, fc2_dims=256)
         self.Q_target = copy.deepcopy(self.Q_eval)
         self.learn_step_counter = 0
-        self.target_update_frequency = 5000 #update target every 5000 steps.
+        self.target_update_frequency = 5500 #update target every 5000 steps.
 
 
         self.memory = ReplayBuffer(max_size=max_mem_size, obs_dim=input_dims)
