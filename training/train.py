@@ -68,7 +68,7 @@ def build_agent(agent_name: str):
     )
 
 
-def train(agent_name: str, run_id: int):
+def train(agent_name: str, run_id: int, resume_path: str = None):
     # ---- Freeze all randomness for reproducible debugging ---- ONLY FOR TESTING
     random.seed(SEED)
     np.random.seed(SEED)
@@ -83,6 +83,9 @@ def train(agent_name: str, run_id: int):
         f"_g{HYPERPARAMS['gamma']}"
         f"_eps{HYPERPARAMS['n_episodes']}_train70"
     )
+    #create the vault folder - to store runs 
+    os.makedirs(f"models/{run_name}", exist_ok=True)
+
     writer = SummaryWriter(f"runs/{run_name}")
     env = BatteryEnv(
         config=env_config,
@@ -93,11 +96,28 @@ def train(agent_name: str, run_id: int):
     )
     agent = build_agent(agent_name)
 
+    start_episode = 0
+    if resume_path and os.path.exists(resume_path):
+        print(f"LOADING CRASH SAVE: Resuming from {resume_path}...")
+        checkpoint = T.load(resume_path)
+
+        # Restore the brain (weights and optimiser)
+        agent.Q_eval.load_state_dict(checkpoint['model_state_dict'])
+        agent.Q_eval.optimiser.load_state_dict(checkpoint['optimizer_state_dict'])
+
+        # Both DQN and DDQN have Q_target — sync it from the restored eval weights
+        agent.Q_target.load_state_dict(checkpoint['model_state_dict'])
+        
+        # Restore the memory of where we were in time
+        agent.epsilon = checkpoint['epsilon']
+        start_episode = checkpoint['episode'] + 1  # Start at the next episode
+        print(f"Successfully restored! Starting at Episode {start_episode} with Epsilon {agent.epsilon:.4f}")
+
     global_step = 0
     scores = []
     log_this_episode = False   # set per episode below
 
-    for i in range(HYPERPARAMS["n_episodes"]):
+    for i in range(start_episode, HYPERPARAMS["n_episodes"]):
         obs, info = env.reset()
         done = False
         step_in_ep = 0
@@ -287,10 +307,23 @@ def train(agent_name: str, run_id: int):
         print(f"[{agent_name.upper()}] Episode {i} | Score: {ep_reward:.2f} | "
               f"Avg: {avg_score:.2f} | ε: {agent.epsilon:.4f}")
 
-        if (i + 1) % 50 == 0: #save every 50 episodes
-            agent.Q_eval.save(f'{agent_name}_checkpoint_ep{i+1}.pth')
+        if (i + 1) % 50 == 0:
+            ckpt_path = f"models/{run_name}/checkpoint_ep{i+1}.pth"
+            T.save({
+                'episode':            i,
+                'epsilon':            agent.epsilon,
+                'model_state_dict':   agent.Q_eval.state_dict(),
+                'optimizer_state_dict': agent.Q_eval.optimiser.state_dict(),
+            }, ckpt_path)
+            print(f"  ✔ Checkpoint saved → {ckpt_path}")
 
-    agent.Q_eval.save(f'{agent_name}_final.pth')
+    T.save({
+        'episode':            HYPERPARAMS["n_episodes"] - 1,
+        'epsilon':            agent.epsilon,
+        'model_state_dict':   agent.Q_eval.state_dict(),
+        'optimizer_state_dict': agent.Q_eval.optimiser.state_dict(),
+    }, f"models/{run_name}/final_model.pth")
+    print(f"  ✔ Final model saved → models/{run_name}/final_model.pth")
     writer.close()
 
 
@@ -317,10 +350,17 @@ if __name__ == "__main__":
         help="Override the default number of episodes for quick testing/profiling",
     )
     
+    parser.add_argument(
+        "--resume-path",
+        type=str,
+        default=None,
+        help="Path to a specific .pth checkpoint file to resume training from",
+    )
+    
     args = parser.parse_args()
 
     # OVERRIDE HYPERPARAMS IF PASSED IN TERMINAL:
     if args.n_episodes is not None:
         HYPERPARAMS["n_episodes"] = args.n_episodes
 
-    train(args.agent, args.run_id)
+    train(args.agent, args.run_id, resume_path=args.resume_path)
