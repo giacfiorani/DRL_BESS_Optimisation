@@ -1,11 +1,11 @@
 import torch as T
 import numpy as np
-from agents.networks import DeepQNetwork
+from agents.networks import DuelingDQN
 from agents.replay_buffer import ReplayBuffer
 import copy
 
 
-class DQNAgent():
+class D3QNAgent():
 
     def __init__(self, gamma, epsilon, lr, input_dims, batch_size, n_actions,
                         max_mem_size = 100000, eps_min =0.01, eps_dec=1e-5):
@@ -18,7 +18,7 @@ class DQNAgent():
         self.eps_dec = eps_dec
         self.eps_min = eps_min
 
-        self.Q_eval = DeepQNetwork(self.lr, n_actions=self.n_actions, input_dims=self.input_dims, fc1_dims=256, fc2_dims=256)
+        self.Q_eval = DuelingDQN(self.lr, n_actions=self.n_actions, input_dims=self.input_dims, fc1_dims=256, fc2_dims=256)
         self.Q_target = copy.deepcopy(self.Q_eval)
         self.learn_step_counter = 0
         self.target_update_frequency = 2000 #update target every 5000 steps.
@@ -66,8 +66,12 @@ class DQNAgent():
         q_pred = q_eval.gather(1, actions.unsqueeze(1)).squeeze(1)
         
         # Target Q-values (The Bellman Equation)
+        q_eval_next = self.Q_eval.forward(states_).detach()
+        best_next_actions = T.argmax(q_eval_next, dim=1)
+
+        # 2. Target network evaluates that specific action
         q_next = self.Q_target.forward(states_).detach()
-        max_q_next = T.max(q_next, dim=1)[0]
+        max_q_next = q_next.gather(1, best_next_actions.unsqueeze(1)).squeeze(1)
 
         # Mask the target if the episode is done
         expected_q_values = rewards + self.gamma * max_q_next * (~dones).float()

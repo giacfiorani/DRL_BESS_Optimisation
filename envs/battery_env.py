@@ -36,7 +36,8 @@ class BatteryEnv(Env):
         config,
         publish_hour: int = 12,
         episode_days: int = 7,
-        randomize_init_soc: bool = False,
+        randomize_init_soc: bool = True,
+        randomize_start: bool = True,
         lambda_ci: float | None = None,
         init_soc_low: float = 0.3,
         init_soc_high: float = 0.7,
@@ -54,6 +55,7 @@ class BatteryEnv(Env):
         self.publish_hour = int(publish_hour)
         self.episode_days = int(episode_days)
         self.randomize_init_soc = bool(randomize_init_soc)
+        self.randomize_start    = bool(randomize_start)
         self.np_random = np.random.default_rng(seed)
 
         # ========
@@ -658,10 +660,11 @@ class BatteryEnv(Env):
                 raise ValueError("Requested delivery_day not in valid_days.")
             start_pos = self.day_pos[start_day]
         else:
-            # Sample randomly within the active split (train/val/test)
-            # max_start = max(len(self.active_valid_days) - self.episode_days, 1)
-            # local_pos = int(self.np_random.integers(0, max_start))
-            local_pos = 0 #harcoded non random start for verification
+            if self.randomize_start:
+                max_start = max(len(self.active_valid_days) - self.episode_days, 1)
+                local_pos = int(self.np_random.integers(0, max_start))
+            else:
+                local_pos = 0  # fixed start — debugging/verification only
             start_pos = self.day_pos[self.active_valid_days[local_pos]]
 
         self.current_day = self.valid_days[start_pos]
