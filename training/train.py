@@ -91,8 +91,9 @@ def train(agent_name: str, run_id: int, resume_path: str = None):
         config=env_config,
         lambda_ci=HYPERPARAMS["lambda_ci"],
         split="train",
-        randomize_init_soc=False,   # always start at SoC_initial
-        seed=SEED,                  # pin the env's internal RNG
+        randomize_init_soc=True,    # randomise starting SoC each episode
+        randomize_start=True,       # randomise 7-day window start within train split
+        seed=SEED,                  # pin env RNG for reproducibility
     )
     agent = build_agent(agent_name)
 

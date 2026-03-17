@@ -30,6 +30,8 @@ from optuna.pruners import MedianPruner
 import envs.env_config
 from agents.dqn_agent import DQNAgent
 from agents.ddqn_agent import DDQNAgent
+from agents.d3qn import D3QNAgent
+from agents.d3qn_per_agent import D3QNPERAgent
 from envs.battery_env import BatteryEnv
 from utils.action_encoding import N_ACTIONS
 from utils.action_encoding import decode
@@ -48,17 +50,17 @@ EVAL_WINDOW = 100
 # clearly bad trials early. Set to 0 to disable pruning.
 PRUNE_INTERVAL = 25
 
-# Seed: same seed for every trial so comparisons are fair (deterministic env).
-SEED = 42
-
 # Fixed params (not searched — set by physics/architecture/ablation plan)
-LAMBDA_CI    = 0.9    # carbon penalty weight — ablated separately in Phase 6
+LAMBDA_CI    = 0.9    # carbon penalty weight — ablated separately later
 INPUT_DIMS   = 103    # observation space size — fixed by env
 EPS_MIN      = 0.01   # minimum epsilon — standard value
+SEED         = 42     # same seed for all trials → fair cross-trial comparison
 
 AGENTS = {
     "dqn":  DQNAgent,
     "ddqn": DDQNAgent,
+    "d3qn":  D3QNAgent,
+    "d3qn_per": D3QNPERAgent,
 }
 
 # ── Search Ranges (rationale) ───────────────────────────────────────────────────
@@ -105,11 +107,12 @@ def objective(trial: optuna.Trial) -> float:
 
     # ── 3. Build environment ──
     env = BatteryEnv(
-        config            = env_config,
-        lambda_ci         = LAMBDA_CI,
-        split             = "train",
-        randomize_init_soc= False,
-        seed              = SEED,
+        config             = env_config,
+        lambda_ci          = LAMBDA_CI,
+        split              = "train",
+        randomize_init_soc = True,   # randomise starting SoC each episode
+        randomize_start    = True,   # randomise 7-day window within train split
+        seed               = SEED,   # same seed for all trials → fair comparison
     )
 
     # ── 4. Build agent ──
@@ -175,8 +178,8 @@ def main():
     args = parser.parse_args()
 
     os.makedirs("optuna_results", exist_ok=True)
-    db_path    = f"optuna_results/{args.agent}_study.db"
-    study_name = f"bess_{args.agent}_hpo"
+    db_path    = f"optuna_results/{args.agent}_rand_study.db"
+    study_name = f"bess_{args.agent}_hpo_rand"
 
     # Suppress verbose Optuna logs — still shows trial results
     optuna.logging.set_verbosity(optuna.logging.WARNING)
