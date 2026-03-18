@@ -3,6 +3,9 @@ import os
 import argparse
 import random
 
+from agents.d3qn import D3QNAgent
+from agents.d3qn_per_agent import D3QNPERAgent
+
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 import numpy as np
@@ -14,11 +17,12 @@ from agents.dqn_agent import DQNAgent
 from agents.ddqn_agent import DDQNAgent
 from envs.battery_env import BatteryEnv
 from utils.action_encoding import decode, N_ACTIONS
+from agents.hyperparams import D3QN_HYPERPARAMS, D3QN_PER_HYPERPARAMS, DDQN_HYPERPARAMS
 
 # ============================================================
-# REPRODUCIBILITY SEED — controls ALL randomness
+# REPRODUCIBILITY SEEDS — 5-seed averaging for academic robustness
 # ============================================================
-SEED = 42
+SEEDS = [0, 1, 2, 3, 4]
 
 # ============================================================
 # STEP-LEVEL MONITORING
@@ -30,18 +34,19 @@ SEED = 42
 STEP_LOG_INTERVAL = 250
 
 # ============================================================
-# HYPERPARAMETERS  —  edit here before each run
+# HYPERPARAMETERS — per-agent Optuna-tuned configs
 # ============================================================
-HYPERPARAMS = {
-    "gamma":        0.975,
-    "epsilon":      1.0,
-    "lr":           1.45e-05,
-    "batch_size":   256,
-    "eps_dec":      1.32e-04,
-    "eps_min":      0.01,
-    "lambda_ci":    0.9,   # 0 = profit only, 1 = equal weight
-    "n_episodes":   500,
+from agents.hyperparams import DDQN_HYPERPARAMS, D3QN_HYPERPARAMS, D3QN_PER_HYPERPARAMS
+
+# DQN uses same architecture as DDQN — share its tuned config
+HYPERPARAMS_MAP = {
+    "dqn":      DDQN_HYPERPARAMS,
+    "ddqn":     DDQN_HYPERPARAMS,
+    "d3qn":     D3QN_HYPERPARAMS,
+    "d3qn_per": D3QN_PER_HYPERPARAMS,
 }
+
+
 
 # ============================================================
 # AGENT REGISTRY  —  add new agents here as they are built
@@ -49,53 +54,57 @@ HYPERPARAMS = {
 AGENTS = {
     "dqn":  DQNAgent,
     "ddqn": DDQNAgent,
+    "d3qn": D3QNAgent,
+    "d3qn_per": D3QNPERAgent,
 }
 
 env_config = envs.env_config
 
 
-def build_agent(agent_name: str):
+def build_agent(agent_name: str, hp: dict):
     cls = AGENTS[agent_name]
     return cls(
-        gamma      = HYPERPARAMS["gamma"],
-        epsilon    = HYPERPARAMS["epsilon"],
-        lr         = HYPERPARAMS["lr"],
-        batch_size = HYPERPARAMS["batch_size"],
-        eps_dec    = HYPERPARAMS["eps_dec"],
-        eps_min    = HYPERPARAMS["eps_min"],
+        gamma      = hp["gamma"],
+        epsilon    = hp["epsilon"],
+        lr         = hp["lr"],
+        batch_size = hp["batch_size"],
+        eps_dec    = hp["eps_dec"],
+        eps_min    = hp["eps_min"],
         input_dims = 103,
         n_actions  = N_ACTIONS,
     )
 
 
-def train(agent_name: str, run_id: int, resume_path: str = None):
-    # ---- Freeze all randomness for reproducible debugging ---- ONLY FOR TESTING
-    random.seed(SEED)
-    np.random.seed(SEED)
-    T.manual_seed(SEED)
+def train(agent_name: str, run_id: int, seed: int = 42, resume_path: str = None):
+    hp = HYPERPARAMS_MAP[agent_name]
+
+    # Freeze all randomness for reproducibility
+    random.seed(seed)
+    np.random.seed(seed)
+    T.manual_seed(seed)
     if T.backends.mps.is_available():
-        T.mps.manual_seed(SEED)
+        T.mps.manual_seed(seed)
 
     run_name = (
         f"{run_id:02d}_{agent_name.upper()}"
-        f"_lci{HYPERPARAMS['lambda_ci']}"
-        f"_lr{HYPERPARAMS['lr']}"
-        f"_g{HYPERPARAMS['gamma']}"
-        f"_eps{HYPERPARAMS['n_episodes']}_train70"
+        f"_seed{seed}"
+        f"_lci{hp['lambda_ci']}"
+        f"_lr{hp['lr']}"
+        f"_g{hp['gamma']}"
+        f"_eps{hp['n_episodes']}_train70"
     )
-    #create the vault folder - to store runs 
     os.makedirs(f"models/{run_name}", exist_ok=True)
 
     writer = SummaryWriter(f"runs/{run_name}")
     env = BatteryEnv(
         config=env_config,
-        lambda_ci=HYPERPARAMS["lambda_ci"],
+        lambda_ci=hp["lambda_ci"],
         split="train",
-        randomize_init_soc=True,    # randomise starting SoC each episode
-        randomize_start=True,       # randomise 7-day window start within train split
-        seed=SEED,                  # pin env RNG for reproducibility
+        randomize_init_soc=True,
+        randomize_start=True,
+        seed=seed,
     )
-    agent = build_agent(agent_name)
+    agent = build_agent(agent_name, hp)
 
     start_episode = 0
     if resume_path and os.path.exists(resume_path):
@@ -118,7 +127,7 @@ def train(agent_name: str, run_id: int, resume_path: str = None):
     scores = []
     log_this_episode = False   # set per episode below
 
-    for i in range(start_episode, HYPERPARAMS["n_episodes"]):
+    for i in range(start_episode, hp["n_episodes"]):
         obs, info = env.reset()
         done = False
         step_in_ep = 0
@@ -318,14 +327,18 @@ def train(agent_name: str, run_id: int, resume_path: str = None):
             }, ckpt_path)
             print(f"  ✔ Checkpoint saved → {ckpt_path}")
 
+    final_path = f"models/{run_name}/final_model.pth"
     T.save({
-        'episode':            HYPERPARAMS["n_episodes"] - 1,
-        'epsilon':            agent.epsilon,
-        'model_state_dict':   agent.Q_eval.state_dict(),
+        'episode':              hp["n_episodes"] - 1,
+        'epsilon':              agent.epsilon,
+        'seed':                 seed,
+        'agent':                agent_name,
+        'model_state_dict':     agent.Q_eval.state_dict(),
         'optimizer_state_dict': agent.Q_eval.optimiser.state_dict(),
-    }, f"models/{run_name}/final_model.pth")
-    print(f"  ✔ Final model saved → models/{run_name}/final_model.pth")
+    }, final_path)
+    print(f"  ✔ Final model saved → {final_path}")
     writer.close()
+    return final_path
 
 
 if __name__ == "__main__":
@@ -343,25 +356,35 @@ if __name__ == "__main__":
         default=1,
         help="Run number prefix in the TensorBoard run name (e.g. 1 → 01_DDQN_...)",
     )
-
+    parser.add_argument(
+        "--seeds",
+        type=int,
+        nargs="+",
+        default=SEEDS,
+        help="Space-separated list of seeds for 5-seed averaging (default: 0 1 2 3 4)",
+    )
     parser.add_argument(
         "--n-episodes",
         type=int,
         default=None,
-        help="Override the default number of episodes for quick testing/profiling",
+        help="Override the number of training episodes",
     )
-    
     parser.add_argument(
         "--resume-path",
         type=str,
         default=None,
-        help="Path to a specific .pth checkpoint file to resume training from",
+        help="Path to a .pth checkpoint to resume from (single-seed runs only)",
     )
-    
+
     args = parser.parse_args()
 
-    # OVERRIDE HYPERPARAMS IF PASSED IN TERMINAL:
+    # Override n_episodes for all agents if passed
     if args.n_episodes is not None:
-        HYPERPARAMS["n_episodes"] = args.n_episodes
+        for hp in HYPERPARAMS_MAP.values():
+            hp["n_episodes"] = args.n_episodes
 
-    train(args.agent, args.run_id, resume_path=args.resume_path)
+    for seed in args.seeds:
+        print(f"\n{'='*60}")
+        print(f"  {args.agent.upper()} | seed={seed}")
+        print(f"{'='*60}")
+        train(args.agent, args.run_id, seed=seed, resume_path=args.resume_path)

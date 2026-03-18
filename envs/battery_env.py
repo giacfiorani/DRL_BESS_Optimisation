@@ -45,6 +45,7 @@ class BatteryEnv(Env):
         split: str = "train",       # "train" | "val" | "test"
         train_ratio: float = 0.70,
         val_ratio: float = 0.15,
+        continuous_action: bool = False, #Continuous vs Discrete Environment
     ):
         # env initialisation
         super().__init__()
@@ -57,6 +58,7 @@ class BatteryEnv(Env):
         self.randomize_init_soc = bool(randomize_init_soc)
         self.randomize_start    = bool(randomize_start)
         self.np_random = np.random.default_rng(seed)
+        self.continuous_action = continuous_action
 
         # ========
         # 1. HARDWARE & MDP PARAMETERS
@@ -211,6 +213,9 @@ class BatteryEnv(Env):
         # ========
         # 3) ACTION SPACE
         # ========
+        # 1. CONTINUOUS 
+
+        # 2. DISCRETE
         # Action space:
         # [dispatch_idx, plan_idx, plan_slot]
         #
@@ -227,10 +232,16 @@ class BatteryEnv(Env):
         # after the DA curve is published, while still dispatching in real time.
 
         self.power_levels = np.linspace(-self.P_max_MW, self.P_max_MW, self.n_power_levels).astype(np.float32)
-        
-        # MultiDiscrete action: [dispatch_idx, plan_idx, plan_slot]
-        self.action_space = gym.spaces.MultiDiscrete([self.n_power_levels, self.n_power_levels, 48])
-        
+
+        if self.continuous_action:
+            # PPO Mode: index 0 = real-time dispatch fraction [-1,1]
+            #           indices 1-48 = full 48-slot DA plan for tomorrow [-1,1] each
+            # Written atomically when da_avail=True, solving the 12:00 PM planning crunch.
+            self.action_space = gym.spaces.Box(low=-1.0, high=1.0, shape=(49,), dtype=np.float32)
+        else:
+            # Discrete Mode: [dispatch_idx, plan_idx, plan_slot]
+            self.action_space = gym.spaces.MultiDiscrete([self.n_power_levels, self.n_power_levels, 48])
+            
         # ========
         # 4) OBSERVATION SPACE
         # ========
@@ -264,10 +275,15 @@ class BatteryEnv(Env):
         self.current_day_idxs = None
         self.slot0 = 0  # 0..47
 
-        # Rolling plans 
-        self.today_plan = np.full(48, -1, dtype=np.int32)  # -1 means “no commitment”  - commitments for current day
-        self.tomorrow_plan = np.full(48, -1, dtype=np.int32) # being built for next day
-        
+        # Rolling plans (discrete mode — integer power-level indices)
+        self.today_plan = np.full(48, -1, dtype=np.int32)  # -1 means “no commitment”
+        self.tomorrow_plan = np.full(48, -1, dtype=np.int32)
+
+        # Continuous mode plan arrays (MW values, not indices)
+        # Always allocated to avoid conditional init; only written in continuous mode.
+        self.today_plan_continuous    = np.zeros(48, dtype=np.float32)
+        self.tomorrow_plan_continuous = np.zeros(48, dtype=np.float32)
+
 
     # =========
     # OCV + PHYSICS HELPERS
@@ -405,11 +421,14 @@ class BatteryEnv(Env):
         idx = int(self.current_day_idxs[self.slot0]) # row index of current settlement period
         tau0 = int(self.tau[idx]) - 1
 
-        # convert plan index to Power
-        planned_idx = int(self.today_plan[tau0])
-        if planned_idx < 0 or planned_idx >= self.n_power_levels:
-            planned_idx = -1 
-        planned_power_now = float(self.power_levels[planned_idx]) if planned_idx >= 0 else 0.0
+        # convert plan to power (MW)
+        if self.continuous_action:
+            planned_power_now = float(self.today_plan_continuous[tau0])
+        else:
+            planned_idx = int(self.today_plan[tau0])
+            if planned_idx < 0 or planned_idx >= self.n_power_levels:
+                planned_idx = -1
+            planned_power_now = float(self.power_levels[planned_idx]) if planned_idx >= 0 else 0.0
 
         # 1. The Indicator Flag: Checks if it is past the 12:00 publish time
         da_avail = 1.0 if self._da_available_now(idx) else 0 # 1 if DA can be used for planningn right now
@@ -457,7 +476,11 @@ class BatteryEnv(Env):
 
         # shift plans: tomorrow plan becomes today's commitment
         self.today_plan = self.tomorrow_plan.copy()
-        self.tomorrow_plan[:] = -1 # reset tomorrow plan buffer
+        self.tomorrow_plan[:] = -1  # reset tomorrow plan buffer
+
+        # continuous mode plan rollover
+        self.today_plan_continuous[:] = self.tomorrow_plan_continuous
+        self.tomorrow_plan_continuous[:] = 0.0
 
         # advance to next delivery day in dataset
         pos = self.day_pos[self.current_day]
@@ -474,32 +497,42 @@ class BatteryEnv(Env):
     # GYM API
     # =========
     def step(self, action):
-        # actions
-        dispatch_idx = int(action[0])
-        plan_idx     = int(action[1])
-        plan_slot    = int(action[2])
-
-        dispatch_idx = int(np.clip(dispatch_idx, 0, self.n_power_levels - 1))
-        plan_idx     = int(np.clip(plan_idx,     0, self.n_power_levels - 1))
-        plan_slot    = int(np.clip(plan_slot,    0, 47))
-
-        # --- current row first ---
+        
+         # --- Get Current Time Index ---
         idx = int(self.current_day_idxs[self.slot0])
         decision_ts = self.delivery_ts[idx] # 1..48
         tau0 = int(self.tau[idx]) - 1  # 0..47
-
-        planned_idx = int(self.today_plan[tau0])
-        if planned_idx < 0 or planned_idx >= self.n_power_levels:
-            planned_idx = -1
 
         # --- availability / tomorrow existence ---
         da_avail = self._da_available_now(idx)
         tomorrow_day = self._get_tomorrow_day_from_delivery_ts(idx)
         tomorrow_exists = tomorrow_day in self.day_indices
 
-        # --- execute dispatch (agent can deviate) ---
-        dispatch_idx_eff = dispatch_idx
-        P_req_MW = float(self.power_levels[dispatch_idx_eff])
+        if self.continuous_action:
+            # --- Continuous Action Parsing ---
+            # action[0]    : real-time dispatch fraction ∈ [-1, 1] → scaled to [-P_max, P_max]
+            # action[1:49] : full 48-slot DA plan for tomorrow, written atomically when da_avail=True
+            P_req_MW  = float(np.clip(action[0], -1.0, 1.0)) * self.P_max_MW
+            P_plan_MW = float(self.today_plan_continuous[tau0])
+            if da_avail and tomorrow_exists:
+                raw = np.array(action[1:49], dtype=np.float32)
+                self.tomorrow_plan_continuous[:] = np.clip(raw, -1.0, 1.0) * self.P_max_MW
+            # sentinel values for info dict compatibility
+            dispatch_idx = plan_idx = plan_slot = planned_idx = -1
+        else:
+            # --- Discrete Action Parsing ---
+            dispatch_idx = int(np.clip(action[0], 0, self.n_power_levels - 1))
+            plan_idx     = int(np.clip(action[1], 0, self.n_power_levels - 1))
+            plan_slot    = int(np.clip(action[2], 0, 47))
+            planned_idx  = int(self.today_plan[tau0])
+            if planned_idx < 0 or planned_idx >= self.n_power_levels:
+                planned_idx = -1
+            P_req_MW  = float(self.power_levels[dispatch_idx])
+            P_plan_MW = float(self.power_levels[planned_idx]) if planned_idx >= 0 else 0.0
+            if da_avail and tomorrow_exists:
+                self.tomorrow_plan[plan_slot] = int(plan_idx)
+
+        # --- execute dispatch ---
         P_applied_MW, I_applied, V_oc_pack = self._apply_soc_protection(P_req_MW, self.soc)
 
         
@@ -513,9 +546,8 @@ class BatteryEnv(Env):
         self.soc = float(self.soc + delta_soc)
 
         # --- planned vs actual power (for reward split) ---
-        P_plan_MW = float(self.power_levels[planned_idx]) if planned_idx >= 0 else 0.0
         P_act_MW  = float(P_applied_MW)
-        P_dev_MW  = P_act_MW - P_plan_MW #deviations of agent from initial plan
+        P_dev_MW  = P_act_MW - P_plan_MW  # deviation from DA plan
 
         da_price_now = float(self.da_price[idx])
         id_price_now = float(self.id_price[idx])
@@ -574,12 +606,7 @@ class BatteryEnv(Env):
 
         self.p_prev = float(P_applied_MW)
 
-        # Tomorrow plan update:
-        # • The agent may update tomorrow's DA plan only after DA publish time.
-        # • The plan applies to the NEXT delivery day.
-        # • The current delivery day's plan is frozen and cannot be changed.
-        if da_avail and tomorrow_exists:
-            self.tomorrow_plan[plan_slot] = int(plan_idx)
+        # Tomorrow plan update is handled inside the action parsing branch above.
 
         # 3) ADVANCE TIME
         # At delivery-day rollover:
@@ -600,11 +627,13 @@ class BatteryEnv(Env):
             "days_done": int(self.days_done),
 
             # --- Agent Action Tracking ---
-            "dispatch_idx_agent": int(action[0]),
-            "plan_idx_agent": int(action[1]),
+            "dispatch_idx_agent": int(dispatch_idx),
+            "plan_idx_agent": int(plan_idx),
             "plan_slot_agent": int(plan_slot),
-            "planned_idx_today" : int(planned_idx),
-            "tomorrow_plan_value_written": int(self.tomorrow_plan[plan_slot]) if da_avail else -999,
+            "planned_idx_today": int(planned_idx),
+            "tomorrow_plan_value_written": (int(self.tomorrow_plan[plan_slot])
+                                            if (da_avail and not self.continuous_action)
+                                            else -999),
             "da_available": bool(da_avail),
 
             # --- Physical Battery Physics ---
@@ -674,6 +703,8 @@ class BatteryEnv(Env):
         # Reset rolling plans
         self.today_plan[:] = -1
         self.tomorrow_plan[:] = -1
+        self.today_plan_continuous[:] = 0.0
+        self.tomorrow_plan_continuous[:] = 0.0
 
         obs = self._get_obs()
         info = {
