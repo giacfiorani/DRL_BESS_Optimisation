@@ -8,7 +8,7 @@ import copy
 class D3QNAgent():
 
     def __init__(self, gamma, epsilon, lr, input_dims, batch_size, n_actions,
-                        max_mem_size = 100000, eps_min =0.01, eps_dec=1e-5):
+                        max_mem_size = 100000, eps_min =0.01, eps_dec=1e-5, replace_target_cnt = 5000):
         self.gamma = gamma
         self.epsilon = epsilon
         self.lr = lr
@@ -21,7 +21,7 @@ class D3QNAgent():
         self.Q_eval = DuelingDQN(self.lr, n_actions=self.n_actions, input_dims=self.input_dims, fc1_dims=256, fc2_dims=256)
         self.Q_target = copy.deepcopy(self.Q_eval)
         self.learn_step_counter = 0
-        self.target_update_frequency = 2000 #update target every 5000 steps.
+        self.target_update_frequency = replace_target_cnt #update target every 5000 steps.
 
         self.memory = ReplayBuffer(max_size=max_mem_size, obs_dim=input_dims)
 

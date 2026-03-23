@@ -3,9 +3,6 @@ import os
 import argparse
 import random
 
-from agents.d3qn import D3QNAgent
-from agents.d3qn_per_agent import D3QNPERAgent
-
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 import numpy as np
@@ -15,9 +12,11 @@ import envs.env_config
 
 from agents.dqn_agent import DQNAgent
 from agents.ddqn_agent import DDQNAgent
+from agents.d3qn import D3QNAgent
+from agents.d3qn_per_agent import D3QNPERAgent
 from envs.battery_env import BatteryEnv
 from utils.action_encoding import decode, N_ACTIONS
-from agents.hyperparams import D3QN_HYPERPARAMS, D3QN_PER_HYPERPARAMS, DDQN_HYPERPARAMS
+from agents.hyperparams import DQN_HYPERPARAMS, DDQN_HYPERPARAMS, D3QN_HYPERPARAMS, D3QN_PER_HYPERPARAMS
 
 # ============================================================
 # REPRODUCIBILITY SEEDS — 5-seed averaging for academic robustness
@@ -36,11 +35,8 @@ STEP_LOG_INTERVAL = 250
 # ============================================================
 # HYPERPARAMETERS — per-agent Optuna-tuned configs
 # ============================================================
-from agents.hyperparams import DDQN_HYPERPARAMS, D3QN_HYPERPARAMS, D3QN_PER_HYPERPARAMS
-
-# DQN uses same architecture as DDQN — share its tuned config
 HYPERPARAMS_MAP = {
-    "dqn":      DDQN_HYPERPARAMS,
+    "dqn":      DQN_HYPERPARAMS,
     "ddqn":     DDQN_HYPERPARAMS,
     "d3qn":     D3QN_HYPERPARAMS,
     "d3qn_per": D3QN_PER_HYPERPARAMS,
@@ -70,6 +66,7 @@ def build_agent(agent_name: str, hp: dict):
         batch_size = hp["batch_size"],
         eps_dec    = hp["eps_dec"],
         eps_min    = hp["eps_min"],
+        replace_target_cnt = hp["target_update_frequency"],
         input_dims = 103,
         n_actions  = N_ACTIONS,
     )

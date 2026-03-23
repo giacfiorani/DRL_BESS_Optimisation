@@ -603,6 +603,9 @@ class BatteryEnv(Env):
         # This mirrors a realistic DA commitment with intraday rebalancing,
         # while physical infeasibility is prevented by SoC safety shielding.
         reward = profit_norm - self.lambda_ci * carbon_norm
+        
+        # non normalised reward  
+        actual_reward = R_total - self.lambda_ci * carbon_cashflow_gbp
 
         self.p_prev = float(P_applied_MW)
 
@@ -650,6 +653,7 @@ class BatteryEnv(Env):
             "ci_now": float(ci_now),
             "mef_now": float(mef_now),
             "carbon_price_now": float(carbon_price_now),
+            "actual_reward": float(actual_reward),
 
             # --- Episode Accumulators (For TensorBoard) ---
             "Planned_Profit": float(R_DA),
