@@ -39,19 +39,21 @@ from utils.action_encoding import decode
 # ── Search Config ──────────────────────────────────────────────────────────────
 
 # Episodes per trial.  Must be long enough for epsilon to decay AND for
-# the agent to exploit. 300 is safe even for slow eps_dec values.
-N_TRIAL_EPISODES = 300
+# the agent to exploit. Extended to 1000 for convergence on large action space.
+N_TRIAL_EPISODES = 1000
 
 # Window of final episodes used to score a trial.
 # Must be ≤ N_TRIAL_EPISODES.  We want this to be exploitation-only.
+# With eps_dec ~2.9e-5, epsilon reaches floor by ep ~100; final 100 eps = pure exploitation.
 EVAL_WINDOW = 100
 
 # Pruning: report intermediate score every N episodes so Optuna can kill
 # clearly bad trials early. Set to 0 to disable pruning.
-PRUNE_INTERVAL = 25
+# Scaled for 1000 episodes: report every 100 (10 checkpoints total).
+PRUNE_INTERVAL = 100
 
 # Fixed params (not searched — set by physics/architecture/ablation plan)
-LAMBDA_CI    = 0.9    # carbon penalty weight — ablated separately later
+LAMBDA_CI    = 0.1    # carbon penalty weight (reduced from 0.9 to avoid carbon trap)
 INPUT_DIMS   = 103    # observation space size — fixed by env
 EPS_MIN      = 0.01   # minimum epsilon — standard value
 SEED         = 42     # same seed for all trials → fair cross-trial comparison
@@ -65,25 +67,28 @@ AGENTS = {
 
 # ── Search Ranges (rationale) ───────────────────────────────────────────────────
 #
-#  lr        [1e-6, 5e-4]  log-uniform
-#               Run 04/05 best was 1e-5; explore ±2 orders of magnitude.
-#               Upper 5e-4 is high but DDQN with Huber loss tolerates it.
+#  lr        [1e-5, 1e-3]  log-uniform
+#               Previous runs (Cao et al., Huang & Chen): 1e-5 to 1e-4 is sweet spot.
+#               Extended upper to 1e-3 to explore aggressive learning (linear scaling
+#               robust to high LR). Lower bound 1e-5 for stability.
 #
-#  eps_dec   [1.5e-5, 2e-4]  log-uniform
-#               Lower bound set so eps_min is reached by ep 200 at the latest:
-#                 0.99 / (200 × 336 steps) = 1.47e-5  →  floor = 1.5e-5
-#               This guarantees ≥ 100 exploitation episodes in EVAL_WINDOW.
-#               Upper bound 2e-4 → eps_min at ep 14; 286 exploitation eps.
+#  eps_dec   [1.0e-4, 2.0e-4]  log-uniform
+#               With 500 episodes: eps_dec=1.5e-4 → eps_min reached by ep ~360-380.
+#               This leaves 120-140 episodes for pure exploitation (healthy window).
+#               Range [1.0e-4, 2.0e-4] spans early exploit (ep 330) to mid (ep 415).
 #
-#  target_update  [500, 6000]  int step 500
-#               Run 04 used 2000 (15 updates/episode with 336 steps).
-#               Explore tighter (500 → almost every episode) and looser (6000).
+#  target_update  [3000, 8000]  int step 500
+#               With 336 steps/episode, target_update controls update frequency.
+#               3000 steps = ~9 updates/ep (frequent); 8000 = ~2.4 updates/ep (stable).
+#               Previous best was ~5500 (sweet spot). Explore ±45% around that.
 #
-#  batch_size  {64, 128, 256}  categorical
-#               128 used so far.  Larger = smoother gradients; smaller = noisier.
+#  batch_size  {64, 128, 256, 512}  categorical
+#               Added 512 (larger batch = smoother gradients, less variance).
+#               Tradeoff: 512 is slower but may improve convergence quality.
 #
 #  gamma       [0.970, 0.999]  uniform
-#               0.99 used so far.  Tight range — large changes break Bellman.
+#               Tight range (prior runs used 0.972-0.996). Small changes in gamma
+#               have large effect on Bellman convergence. Explored range is safe.
 
 env_config = envs.env_config
 
@@ -92,10 +97,10 @@ env_config = envs.env_config
 
 def objective(trial: optuna.Trial) -> float:
     # ── 1. Sample hyperparameters ──
-    lr          = trial.suggest_float("lr",       1e-6, 5e-4, log=True)
-    eps_dec     = trial.suggest_float("eps_dec", 1.5e-5, 2e-4, log=True)
-    target_upd  = trial.suggest_int  ("target_update", 500, 6000, step=500)
-    batch_size  = trial.suggest_categorical("batch_size", [64, 128, 256])
+    lr          = trial.suggest_float("lr",       1e-5, 1e-3, log=True)
+    eps_dec =   trial.suggest_float("eps_dec",  5e-6, 3e-5, log=True)
+    target_upd  = trial.suggest_int  ("target_update", 3000, 8000, step=500)
+    batch_size  = trial.suggest_categorical("batch_size", [64, 128, 256, 512])
     gamma       = trial.suggest_float("gamma",   0.970, 0.999)
 
     # ── 2. Freeze randomness (same seed → fair cross-trial comparison) ──

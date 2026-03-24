@@ -54,6 +54,13 @@ self_dis = 0.0  # Self-discharge rate per timestep (set to 0 for simplicity)
 # ======
 deg_kappa = 35.0
 
+# CARBON Thresholds
+
+alpha_thresh = 100.0
+monthly_budget = 20.0
+scale_numeric = 5.0
+
+
 # ========
 # POWER AND TIMING PARAMETERS
 # ========

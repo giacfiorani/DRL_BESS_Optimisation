@@ -110,6 +110,14 @@ class BatteryEnv(Env):
         # Instantiate Degradation Model — Cortés-Arcos et al. (2020) Eq. 23
         self.degradation_model = ThroughputDegradation(self.deg_kappa)
 
+        self.E_max = config.E_max  # MWh - rated capacity (0.3727 from env_config)
+
+        self.alpha_thresh = config.alpha_thresh
+        self.monthly_budget = config.monthly_budget  
+        self.scale_numeric = config.scale_numeric
+
+        self.scale_universal = self.profit_scale / self.E_max
+
         # ========
         # Read from OCV Lookup Table and Interpolate to get OCV-SOC Curve
         # ========
@@ -555,7 +563,6 @@ class BatteryEnv(Env):
         ci_now = float(self.ci[idx])
         mef_now = float(self.mef[idx])
 
-
         # --- DA + ID revenue ---
         # energy
         E_plan_MWh = P_plan_MW * self.dt_hours
@@ -563,73 +570,44 @@ class BatteryEnv(Env):
 
         # DEGRADATION COST — Cortés-Arcos et al. (2020) Eq. 23
         deg_cost = self.degradation_model.calculate_costs(P_act_MW, dt_hours=self.dt_hours)
-
-        # Raw profits (£)
+        
         R_DA = E_plan_MWh * da_price_now
         R_ID = E_dev_MWh  * id_price_now
-        R_total = R_DA + R_ID - deg_cost
 
-        # Carbon cashflow (£) using UKA price
         E_act_MWh = P_act_MW * self.dt_hours
         E_import_kWh = max(-E_act_MWh, 0.0) * 1000.0
         E_export_kWh = max(E_act_MWh, 0.0) * 1000.0
 
-        net_tCO2 = (E_import_kWh * ci_now - E_export_kWh * mef_now) / 1e6  # g -> tCO2
+        net_tCO2 = (E_import_kWh * ci_now - E_export_kWh * mef_now) / 1e6  
         carbon_cashflow_gbp = carbon_price_now * net_tCO2
 
-        # Normalisation
-        profit_norm = np.tanh(R_total / self.profit_scale)
-        carbon_norm = np.tanh(carbon_cashflow_gbp / self.carbon_scale)
-
+        steps_per_month = 48 * 30 
+        e_th = self.monthly_budget / steps_per_month 
         
-
-        # Reward decomposition (Plan + Adjust):
-        #
-        # • DA revenue:
-        #   Energy committed in the DA plan is settled at the DA price.
-        #
-        # • ID revenue:
-        #   Any deviation between actual dispatch and DA plan is settled
-        #   at the intraday (MID) price.
-        #
-        # • Degradation cost:
-        #   Subtracted directly from the gross market revenue to calculate Net Profit.
-        #   Modeled as a SoC-weighted marginal cost of energy throughput.
-        #
-        # • Carbon penalty:
-        #   Applied to actual energy imported/exported, based on realised
-        #   carbon intensity.
-        #
-        # This mirrors a realistic DA commitment with intraday rebalancing,
-        # while physical infeasibility is prevented by SoC safety shielding.
-        reward = profit_norm - self.lambda_ci * carbon_norm
+        emissions_tco2 = E_import_kWh * ci_now / 1e6
+        # P_thresh threshold penalty removed in favour of linear-clipped reward
+        P_thresh = 0.0  # Placeholder for backward compatibility in info dict
+        R_total_gbp = R_DA + R_ID - deg_cost - (self.lambda_ci or 0.0) * carbon_cashflow_gbp 
         
-        # non normalised reward  
-        actual_reward = R_total - self.lambda_ci * carbon_cashflow_gbp
+        # --- NEW DATA-DRIVEN LINEAR SCALING ---
+        r_mwh = R_total_gbp / self.E_max
+        r_step = r_mwh / self.scale_universal
+        reward = float(np.clip(r_step, -1.0, 1.0))
+        actual_reward = float(R_total_gbp) 
 
         self.p_prev = float(P_applied_MW)
 
-        # Tomorrow plan update is handled inside the action parsing branch above.
-
-        # 3) ADVANCE TIME
-        # At delivery-day rollover:
-        # • tomorrow_plan becomes today_plan (fixed DA commitment)
-        # • a fresh tomorrow_plan buffer is initialised
         ok = self._advance_one_slot()
-
         terminated = (self.days_done >= self.episode_days)
         truncated = (not ok) and (not terminated)
 
         obs = self._get_obs()
 
         info = {
-           # --- Essential Timestamps / Indices ---
             "delivery_ts": str(self.delivery_ts[idx]),
             "tau": int(tau0 + 1),
             "idx": int(idx),
             "days_done": int(self.days_done),
-
-            # --- Agent Action Tracking ---
             "dispatch_idx_agent": int(dispatch_idx),
             "plan_idx_agent": int(plan_idx),
             "plan_slot_agent": int(plan_slot),
@@ -638,33 +616,28 @@ class BatteryEnv(Env):
                                             if (da_avail and not self.continuous_action)
                                             else -999),
             "da_available": bool(da_avail),
-
-            # --- Physical Battery Physics ---
             "P_req_MW": float(P_req_MW),
-            "P_planned_MW" : float(P_plan_MW),     # (Also acts as DA_dispatched_MW)
-            "P_dev_MW" : float(P_dev_MW),          # (Also acts as ID_dispatched_MW)
+            "P_planned_MW" : float(P_plan_MW),     
+            "P_dev_MW" : float(P_dev_MW),          
             "P_applied_MW": float(P_applied_MW),
             "soc": float(self.soc),
             "delta_soc": float(delta_soc),
-
-            # --- Market & Environment Variables ---
             "da_price_now": float(da_price_now),
             "id_price_now": float(id_price_now),
             "ci_now": float(ci_now),
             "mef_now": float(mef_now),
             "carbon_price_now": float(carbon_price_now),
             "actual_reward": float(actual_reward),
-
-            # --- Episode Accumulators (For TensorBoard) ---
             "Planned_Profit": float(R_DA),
             "Intraday_Profit": float(R_ID),
             "degradation_cost_gbp": float(deg_cost), 
             "carbon_cashflow": float(carbon_cashflow_gbp),
-            "net_carbon_tCO2": float(net_tCO2),      
-
-            # --- Neural Network Normalisation ---
-            "profit_norm": float(profit_norm),
-            "carbon_penalty_norm": float(carbon_norm),
+            "net_carbon_tCO2": float(net_tCO2),
+            "emissions_tco2": float(emissions_tco2),
+            "P_thresh_gbp": float(P_thresh),
+            "R_total_gbp": float(R_total_gbp),
+            "r_mwh": float(r_mwh),
+            "reward_raw": float(reward),
         }
 
         return obs, float(reward), bool(terminated), bool(truncated), info
@@ -688,8 +661,8 @@ class BatteryEnv(Env):
 
         # Choose starting day within the active split, with enough room for episode_days
         if options is not None and options.get("delivery_day") is not None:
-            start_day = np.datetime64(pd.to_datetime(options["delivery_day"]).floor("D"))
-            if start_day not in set(self.valid_days.tolist()):
+            start_day = np.datetime64(options["delivery_day"], "D")
+            if not (self.valid_days == start_day).any():
                 raise ValueError("Requested delivery_day not in valid_days.")
             start_pos = self.day_pos[start_day]
         else:

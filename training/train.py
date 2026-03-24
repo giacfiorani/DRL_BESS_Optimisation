@@ -21,14 +21,12 @@ from agents.hyperparams import DQN_HYPERPARAMS, DDQN_HYPERPARAMS, D3QN_HYPERPARA
 # ============================================================
 # REPRODUCIBILITY SEEDS — 5-seed averaging for academic robustness
 # ============================================================
-SEEDS = [0, 1, 2, 3, 4]
+SEEDS = [0, 1, 2, 3, 4, 42]
 
 # ============================================================
 # STEP-LEVEL MONITORING
 # Every STEP_LOG_INTERVAL episodes, every step of that episode
 # is logged under Step/ tags in TensorBoard.
-# Set to 0 to disable, or lower for denser snapshots.
-# With 336 steps/ep and interval=50 → 10 snapshots over 500 eps.
 # ============================================================
 STEP_LOG_INTERVAL = 250
 
@@ -41,8 +39,6 @@ HYPERPARAMS_MAP = {
     "d3qn":     D3QN_HYPERPARAMS,
     "d3qn_per": D3QN_PER_HYPERPARAMS,
 }
-
-
 
 # ============================================================
 # AGENT REGISTRY  —  add new agents here as they are built
@@ -161,19 +157,19 @@ def train(agent_name: str, run_id: int, seed: int = 42, resume_path: str = None)
 
             # -- Accumulate --
             ep_reward         += reward
-            # ep_da_revenue     += info["Planned_Profit"]
-            # ep_id_revenue     += info["Intraday_Profit"]
-            # ep_carbon_gbp     += info["carbon_penalty_norm"]
-            # ep_deg_cost_gbp   += info["degradation_cost_gbp"]
-            # ep_throughput_mwh += abs(info["P_applied_MW"]) * 0.5
-            # ep_carbon_kg      += info["net_carbon_tCO2"]
-            # ep_p_req_list.append(info["P_req_MW"])
-            # ep_p_applied_list.append(info["P_applied_MW"])
-            # ep_soc_list.append(info["soc"])
-            # ep_p_dev_list.append(info["P_dev_MW"])
+            ep_da_revenue     += info["Planned_Profit"]
+            ep_id_revenue     += info["Intraday_Profit"]
+            ep_carbon_gbp     += info["carbon_cashflow"]
+            ep_deg_cost_gbp   += info["degradation_cost_gbp"]
+            ep_throughput_mwh += abs(info["P_applied_MW"]) * 0.5
+            ep_carbon_kg      += info["net_carbon_tCO2"]
+            ep_p_req_list.append(info["P_req_MW"])
+            ep_p_applied_list.append(info["P_applied_MW"])
+            ep_soc_list.append(info["soc"])
+            ep_p_dev_list.append(info["P_dev_MW"])
 
-            # if abs(info["P_req_MW"] - info["P_applied_MW"]) > 1e-4:
-            #     ep_clip_events += 1
+            if abs(info["P_req_MW"] - info["P_applied_MW"]) > 1e-4:
+                ep_clip_events += 1
             if info["da_available"] and info["tomorrow_plan_value_written"] >= 0:
                 ep_da_plan_edits += 1
             if loss is not None:
@@ -185,19 +181,10 @@ def train(agent_name: str, run_id: int, seed: int = 42, resume_path: str = None)
 
             # ----------------------------------------------------------------
             # STEP-LEVEL SNAPSHOT — logged every STEP_LOG_INTERVAL episodes.
-            # X-axis = step_in_ep (0–335). Tag prefix encodes the episode so
-            # each snapshot is its own labelled series in TensorBoard.
-            # Sanity-check expectations noted inline for each group.
             # ----------------------------------------------------------------
             if log_this_episode:
                 s = step_in_ep
 
-                # ── 1. Battery Physics ──────────────────────────────────────
-                # SoC       : must always stay in [SoC_min, SoC_max] (~0.10–0.90)
-                # delta_soc : bounded by P_max*dt/E_cap ≈ ±0.025 per step
-                # P_applied : |P| ≤ P_max = 0.18635 MW at all times
-                # P_req vs P_applied : differ ONLY when SoC clipping fires
-                # P_dev     = P_applied − P_planned  (intraday imbalance)
                 writer.add_scalar(f"Step_ep{i:04d}/Bat_SoC",          info["soc"],          s)
                 writer.add_scalar(f"Step_ep{i:04d}/Bat_Delta_SoC",    info["delta_soc"],    s)
                 writer.add_scalar(f"Step_ep{i:04d}/Bat_P_applied_MW", info["P_applied_MW"], s)
@@ -205,33 +192,17 @@ def train(agent_name: str, run_id: int, seed: int = 42, resume_path: str = None)
                 writer.add_scalar(f"Step_ep{i:04d}/Bat_P_planned_MW", info["P_planned_MW"], s)
                 writer.add_scalar(f"Step_ep{i:04d}/Bat_P_dev_MW",     info["P_dev_MW"],     s)
 
-                # ── 2. Agent Decisions ──────────────────────────────────────
-                # dispatch_idx   : 0 = max-discharge, 5 = idle, 10 = max-charge
-                # planned_today  : DA plan level committed for this slot
-                # da_available   : 1 from slot 24 onward each day (window open)
-                # plan_written   : plan_idx written this step; −999 = window closed
                 writer.add_scalar(f"Step_ep{i:04d}/Act_Dispatch_idx",    info["dispatch_idx_agent"],             s)
                 writer.add_scalar(f"Step_ep{i:04d}/Act_Planned_Today",   info["planned_idx_today"],              s)
                 writer.add_scalar(f"Step_ep{i:04d}/Act_DA_Available",    float(info["da_available"]),            s)
                 writer.add_scalar(f"Step_ep{i:04d}/Act_Plan_Written",    info["tomorrow_plan_value_written"],    s)
 
-                # ── 3. Market Signals ───────────────────────────────────────
-                # DA / ID prices in £/MWh — correlated but not identical.
-                # CI in gCO2/kWh — spikes at morning/evening peaks.
-                # MEF = marginal emission factor (tCO2/MWh).
                 writer.add_scalar(f"Step_ep{i:04d}/Mkt_DA_Price",      info["da_price_now"],     s)
                 writer.add_scalar(f"Step_ep{i:04d}/Mkt_ID_Price",      info["id_price_now"],     s)
                 writer.add_scalar(f"Step_ep{i:04d}/Mkt_CI",            info["ci_now"],           s)
                 writer.add_scalar(f"Step_ep{i:04d}/Mkt_MEF",           info["mef_now"],          s)
                 writer.add_scalar(f"Step_ep{i:04d}/Mkt_Carbon_Price",  info["carbon_price_now"], s)
 
-                # ── 4. Revenue / Cost Decomposition ────────────────────────
-                # DA_GBP    = P_planned × DA_price × 0.5h  (day-ahead settlement)
-                # ID_GBP    = P_dev × ID_price × 0.5h      (intraday rebalance)
-                # Gross_GBP = DA + ID before costs
-                # Deg_GBP   > 0 always, proportional to |P_applied|
-                # Carbon    can be +/− (charging imports carbon cost; discharging exports credit)
-                # Net_GBP   = Gross − Deg − Carbon  (true per-step profit)
                 R_gross = info["Planned_Profit"] + info["Intraday_Profit"]
                 R_net   = R_gross - info["degradation_cost_gbp"] - info["carbon_cashflow"]
                 writer.add_scalar(f"Step_ep{i:04d}/Rev_DA_GBP",       info["Planned_Profit"],       s)
@@ -242,18 +213,12 @@ def train(agent_name: str, run_id: int, seed: int = 42, resume_path: str = None)
                 writer.add_scalar(f"Step_ep{i:04d}/Rev_Net_GBP",      R_net,                        s)
                 writer.add_scalar(f"Step_ep{i:04d}/Rev_Carbon_tCO2",  info["net_carbon_tCO2"],      s)
 
-                # ── 5. Reward Construction ──────────────────────────────────
-                # profit_norm and carbon_norm are tanh-normalised → (−1, +1).
-                # reward = profit_norm − λ_ci × carbon_norm  →  (≈ −1.9, +1.9).
-                # Both norms should move together when dispatch is profitable
-                # but high-CI — that trade-off is the λ_ci penalty.
-                writer.add_scalar(f"Step_ep{i:04d}/Rew_Profit_Norm",  info["profit_norm"],         s)
-                writer.add_scalar(f"Step_ep{i:04d}/Rew_Carbon_Norm",  info["carbon_penalty_norm"], s)
-                writer.add_scalar(f"Step_ep{i:04d}/Rew_Total",        reward,                      s)
+                # --- NEW LINEAR CLIPPED REWARD LOGGING ---
+                writer.add_scalar(f"Step_ep{i:04d}/Rew_Total_GBP",    info["R_total_gbp"],    s)
+                writer.add_scalar(f"Step_ep{i:04d}/Rew_Thresh_Pen",   info["P_thresh_gbp"],   s)
+                writer.add_scalar(f"Step_ep{i:04d}/Rew_r_MWh",        info["r_mwh"],          s)
+                writer.add_scalar(f"Step_ep{i:04d}/Rew_Final_Clipped",reward,                 s)
 
-                # ── 6. Episode Position ─────────────────────────────────────
-                # tau       : half-hour slot within the current day (0–47)
-                # days_done : number of complete days elapsed this episode
                 writer.add_scalar(f"Step_ep{i:04d}/Pos_Tau",       info["tau"],       s)
                 writer.add_scalar(f"Step_ep{i:04d}/Pos_Days_Done", info["days_done"], s)
 
@@ -268,11 +233,11 @@ def train(agent_name: str, run_id: int, seed: int = 42, resume_path: str = None)
         avg_score = np.mean(scores[-100:])
 
         # 1. Reward Decomposition
-        writer.add_scalar("Reward/Total_Episode",       ep_reward,         i)
+        writer.add_scalar("Reward/Total_Episode_Clipped", ep_reward,         i)
         # writer.add_scalar("Reward/DA_Revenue_GBP",      ep_da_revenue,     i)
         # writer.add_scalar("Reward/ID_Revenue_GBP",      ep_id_revenue,     i)
         # writer.add_scalar("Reward/Degradation_Cost",    ep_deg_cost_gbp,   i)
-        # writer.add_scalar("Reward/Carbon_Penalty_Norm", ep_carbon_gbp,     i)
+        # writer.add_scalar("Reward/Carbon_Cashflow_GBP", ep_carbon_gbp,     i)
 
         # profit_without_deg = ep_id_revenue + ep_da_revenue
         # profit_with_deg    = profit_without_deg - ep_deg_cost_gbp
