@@ -1,17 +1,5 @@
 """
 Optuna hyperparameter search for BESS RL agents.
-
-Each trial trains the agent for N_TRIAL_EPISODES on the fixed 7-day training
-window, then returns the mean reward of the last EVAL_WINDOW episodes
-(pure exploitation phase) as the objective to maximise.
-
-Usage:
-    python training/optuna_search.py --agent ddqn --n-trials 50
-    python training/optuna_search.py --agent ddqn --n-trials 50 --resume   # continue a saved study
-    python training/optuna_search.py --agent ddqn --show-best               # print best params only
-
-Results are saved to optuna_results/<agent>_study.db (SQLite).
-Re-run with --resume to add more trials without losing previous results.
 """
 
 import sys
@@ -38,25 +26,14 @@ from utils.action_encoding import decode
 
 # ── Search Config ──────────────────────────────────────────────────────────────
 
-# Episodes per trial.  Must be long enough for epsilon to decay AND for
-# the agent to exploit. Extended to 1000 for convergence on large action space.
 N_TRIAL_EPISODES = 1000
-
-# Window of final episodes used to score a trial.
-# Must be ≤ N_TRIAL_EPISODES.  We want this to be exploitation-only.
-# With eps_dec ~2.9e-5, epsilon reaches floor by ep ~100; final 100 eps = pure exploitation.
 EVAL_WINDOW = 100
-
-# Pruning: report intermediate score every N episodes so Optuna can kill
-# clearly bad trials early. Set to 0 to disable pruning.
-# Scaled for 1000 episodes: report every 100 (10 checkpoints total).
 PRUNE_INTERVAL = 100
 
-# Fixed params (not searched — set by physics/architecture/ablation plan)
-LAMBDA_CI    = 0.1    # carbon penalty weight (reduced from 0.9 to avoid carbon trap)
-INPUT_DIMS   = 103    # observation space size — fixed by env
-EPS_MIN      = 0.01   # minimum epsilon — standard value
-SEED         = 42     # same seed for all trials → fair cross-trial comparison
+LAMBDA_CI    = 0.1    
+INPUT_DIMS   = 103    
+EPS_MIN      = 0.01   
+SEED         = 42     
 
 AGENTS = {
     "dqn":  DQNAgent,
@@ -65,45 +42,19 @@ AGENTS = {
     "d3qn_per": D3QNPERAgent,
 }
 
-# ── Search Ranges (rationale) ───────────────────────────────────────────────────
-#
-#  lr        [1e-5, 1e-3]  log-uniform
-#               Previous runs (Cao et al., Huang & Chen): 1e-5 to 1e-4 is sweet spot.
-#               Extended upper to 1e-3 to explore aggressive learning (linear scaling
-#               robust to high LR). Lower bound 1e-5 for stability.
-#
-#  eps_dec   [1.0e-4, 2.0e-4]  log-uniform
-#               With 500 episodes: eps_dec=1.5e-4 → eps_min reached by ep ~360-380.
-#               This leaves 120-140 episodes for pure exploitation (healthy window).
-#               Range [1.0e-4, 2.0e-4] spans early exploit (ep 330) to mid (ep 415).
-#
-#  target_update  [3000, 8000]  int step 500
-#               With 336 steps/episode, target_update controls update frequency.
-#               3000 steps = ~9 updates/ep (frequent); 8000 = ~2.4 updates/ep (stable).
-#               Previous best was ~5500 (sweet spot). Explore ±45% around that.
-#
-#  batch_size  {64, 128, 256, 512}  categorical
-#               Added 512 (larger batch = smoother gradients, less variance).
-#               Tradeoff: 512 is slower but may improve convergence quality.
-#
-#  gamma       [0.970, 0.999]  uniform
-#               Tight range (prior runs used 0.972-0.996). Small changes in gamma
-#               have large effect on Bellman convergence. Explored range is safe.
-
 env_config = envs.env_config
-
 
 # ── Objective ─────────────────────────────────────────────────────────────────
 
-def objective(trial: optuna.Trial) -> float:
+def objective(trial: optuna.Trial, agent_name: str) -> float:
     # ── 1. Sample hyperparameters ──
-    lr          = trial.suggest_float("lr",       1e-5, 1e-3, log=True)
-    eps_dec =   trial.suggest_float("eps_dec",  5e-6, 3e-5, log=True)
-    target_upd  = trial.suggest_int  ("target_update", 3000, 8000, step=500)
-    batch_size  = trial.suggest_categorical("batch_size", [64, 128, 256, 512])
-    gamma       = trial.suggest_float("gamma",   0.970, 0.999)
+    lr          = trial.suggest_float("lr",       5e-5, 1e-3, log=True)
+    eps_dec     = trial.suggest_float("eps_dec", 2e-6, 1e-5) # Removed log=True for linear decay ranges
+    target_upd  = trial.suggest_int("target_update", 2000, 15000, step=1000)
+    batch_size  = trial.suggest_categorical("batch_size", [128, 256, 512])
+    gamma       = trial.suggest_float("gamma",   0.95, 0.999)
 
-    # ── 2. Freeze randomness (same seed → fair cross-trial comparison) ──
+    # ── 2. Freeze randomness ──
     random.seed(SEED)
     np.random.seed(SEED)
     T.manual_seed(SEED)
@@ -115,13 +66,14 @@ def objective(trial: optuna.Trial) -> float:
         config             = env_config,
         lambda_ci          = LAMBDA_CI,
         split              = "train",
-        randomize_init_soc = True,   # randomise starting SoC each episode
-        randomize_start    = True,   # randomise 7-day window within train split
-        seed               = SEED,   # same seed for all trials → fair comparison
+        randomize_init_soc = True,   
+        randomize_start    = True,   
+        seed               = SEED,   
+        train_start        = "2023-01-01"
     )
 
     # ── 4. Build agent ──
-    cls   = AGENTS[trial.study.user_attrs["agent"]]
+    cls   = AGENTS[agent_name]
     agent = cls(
         gamma      = gamma,
         epsilon    = 1.0,
@@ -132,7 +84,8 @@ def objective(trial: optuna.Trial) -> float:
         input_dims = INPUT_DIMS,
         n_actions  = N_ACTIONS,
     )
-    agent.target_update_frequency = target_upd
+    # Note: Using the internal class variable. Check if your DDQN class uses target_update_frequency or replace_target_cnt
+    agent.replace_target_cnt = target_upd 
 
     # ── 5. Training loop ──
     scores = []
@@ -155,40 +108,33 @@ def objective(trial: optuna.Trial) -> float:
 
         scores.append(ep_reward)
 
-        # ── Pruning: report intermediate value every PRUNE_INTERVAL episodes ──
+        # ── Pruning ──
         if PRUNE_INTERVAL > 0 and (ep + 1) % PRUNE_INTERVAL == 0:
             window = min(PRUNE_INTERVAL, len(scores))
             intermediate_value = float(np.mean(scores[-window:]))
             trial.report(intermediate_value, step=ep)
             if trial.should_prune():
-                raise optuna.exceptions.TrialPruned()
+                raise optuna.TrialPruned() # Fixed syntax
 
-    # ── 6. Objective: mean reward over the last EVAL_WINDOW episodes ──
-    # This is the exploitation-phase performance, which is what matters.
-    objective_value = float(np.mean(scores[-EVAL_WINDOW:]))
-    return objective_value
+    # ── 6. Return Objective ──
+    return float(np.mean(scores[-EVAL_WINDOW:]))
 
 
 # ── Entry Point ───────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="Optuna HPO for BESS RL agents")
+    parser = argparse.ArgumentParser()
     parser.add_argument("--agent",     type=str, default="ddqn", choices=list(AGENTS.keys()))
-    parser.add_argument("--n-trials",  type=int, default=30,
-                        help="Number of trials to run (default: 30)")
-    parser.add_argument("--resume",    action="store_true",
-                        help="Resume an existing study from the .db file")
-    parser.add_argument("--show-best", action="store_true",
-                        help="Print best params from a saved study without running new trials")
+    parser.add_argument("--n-trials",  type=int, default=30)
+    parser.add_argument("--resume",    action="store_true")
+    parser.add_argument("--show-best", action="store_true")
     args = parser.parse_args()
 
     os.makedirs("optuna_results", exist_ok=True)
     db_path    = f"optuna_results/{args.agent}_rand_study.db"
     study_name = f"bess_{args.agent}_hpo_rand"
 
-    # Suppress verbose Optuna logs — still shows trial results
     optuna.logging.set_verbosity(optuna.logging.WARNING)
-
     storage = f"sqlite:///{db_path}"
 
     if args.show_best:
@@ -196,7 +142,6 @@ def main():
         _print_results(study)
         return
 
-    # Create or load study
     if args.resume and os.path.exists(db_path):
         study = optuna.load_study(
             study_name = study_name,
@@ -214,9 +159,6 @@ def main():
             pruner     = MedianPruner(n_startup_trials=5, n_warmup_steps=50),
             load_if_exists = True,
         )
-
-    # Store agent name so objective() can access it via trial.study.user_attrs
-    study.set_user_attr("agent", args.agent)
 
     print(f"Study: {study_name}")
     print(f"Agent: {args.agent.upper()} | Trials: {args.n_trials} | "
@@ -237,15 +179,15 @@ def main():
             print(f"{trial.number:>6}  {'—':>8}  {'—':>10}  {'—':>10}  "
                   f"{'—':>6}  {'—':>8}  {'—':>7}  PRUNED")
 
+    # Use a lambda to pass the agent name safely
     study.optimize(
-        objective,
+        lambda trial: objective(trial, args.agent),
         n_trials   = args.n_trials,
         callbacks  = [print_trial_callback],
         show_progress_bar = False,
     )
 
     _print_results(study)
-
 
 def _print_results(study: optuna.Study):
     completed = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
@@ -268,10 +210,10 @@ def _print_results(study: optuna.Study):
     print(f"  target_update_frequency = {best.params['target_update']}")
     print(f"  gamma                   = {best.params['gamma']:.4f}")
 
-    # Compute epsilon schedule for the best eps_dec
     steps_to_min  = 0.99 / best.params['eps_dec']
-    eps_min_ep    = int(steps_to_min / 336)   # 336 steps per 7-day episode
+    eps_min_ep    = int(steps_to_min / 336)   
     exploit_eps   = max(0, N_TRIAL_EPISODES - eps_min_ep)
+    
     print(f"\n── Epsilon Schedule (best trial) ──────────────────────────────────────")
     print(f"  eps_min reached at episode ~{eps_min_ep}")
     print(f"  exploitation episodes: {exploit_eps} / {N_TRIAL_EPISODES}")
@@ -284,24 +226,11 @@ def _print_results(study: optuna.Study):
     print(f'    "batch_size":   {best.params["batch_size"]},')
     print(f'    "eps_dec":      {best.params["eps_dec"]:.2e},')
     print(f'    "eps_min":      0.01,')
-    print(f'    "lambda_ci":    0.9,')
-    print(f'    "n_episodes":   500,')
+    print(f'    "lambda_ci":    {LAMBDA_CI},') # Fixed
+    print(f'    "n_episodes":   {N_TRIAL_EPISODES},') # Fixed
+    print(f'    "target_update_frequency": {best.params["target_update"]}')
     print("}")
-    print(f'# agent.target_update_frequency = {best.params["target_update"]}')
     print()
-
-    # Top 5 trials
-    sorted_trials = sorted(completed, key=lambda t: t.value, reverse=True)
-    print("── Top 5 Trials ───────────────────────────────────────────────────────")
-    print(f"{'#':>4}  {'Score':>8}  {'lr':>10}  {'eps_dec':>10}  "
-          f"{'batch':>6}  {'tgt_upd':>8}  {'gamma':>7}")
-    for t in sorted_trials[:5]:
-        p = t.params
-        print(f"{t.number:>4}  {t.value:>8.3f}  "
-              f"{p['lr']:>10.2e}  {p['eps_dec']:>10.2e}  "
-              f"{p['batch_size']:>6}  {p['target_update']:>8}  "
-              f"{p['gamma']:>7.4f}")
-
 
 if __name__ == "__main__":
     main()

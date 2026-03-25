@@ -2,6 +2,7 @@ import numpy as np
 from pathlib import Path
 import pandas as pd
 import envs.reward_scaling
+from envs.reward_scaling import compute_scales
 
 # ====
 # Load Whole dataset dataframe
@@ -20,13 +21,23 @@ episode_days = 30
 # ========
 # BESS HARDWARE SPECIFICATIONS (CATL EnerOne, Liquid-Cooled Rack)
 # ========
-N_cells = 416  # 1P416S: 416 cells in series
+# Single Cabinet Configuration (1P416S)
+N_cells_per_cabinet = 416  # 1P416S: 416 cells in series
 Q_cell = 280  # Ah (CATL 280Ah LFP prismatic cells)
-Q_cell_C = 280 * 3600  # C (Coulombs) for Coulomb counting: Q = 280 Ah × 3600 s/h
-V_nominal = 1331.2  # V (nominal pack voltage)
-E_nominal = 372.7  # kWh (nominal energy)
-E_max = 0.3727  # MWh (same as E_nominal, converted to MWh)
-R_cell_mOhm = 0.4 # mΩ per cell (from Product Specification Sheet)
+V_nominal = 1331.2  # V (nominal pack voltage, invariant under parallel wiring)
+E_nominal_per_cabinet = 372.7  # kWh (single cabinet nominal energy)
+R_cell_mOhm = 0.4  # mΩ per cell (from Product Specification Sheet)
+
+# Parallel Wiring Scaling (Utility-Scale Plant)
+# Derivation: 99.7 MWh / 0.3727 MWh = 268 cabinets in parallel
+N_cabinets = 268
+
+# Scaled Plant Specifications
+N_cells = N_cells_per_cabinet  # Total series depth per branch (unchanged)
+Q_cell_C = Q_cell * N_cabinets * 3600  # C (Coulombs) — scaled pack charge: 280 Ah × 268 × 3600 s/h
+E_nominal = E_nominal_per_cabinet * N_cabinets  # kWh (scaled nominal energy: 372.7 × 268)
+E_max = E_nominal / 1000.0  # MWh (converted: 99.9 kWh = ~0.0999 MWh)
+
 
 # ========
 # OPERATIONAL PARAMETERS
@@ -45,14 +56,24 @@ self_dis = 0.0  # Self-discharge rate per timestep (set to 0 for simplicity)
 # ======
 # DEGRADATION MODEL PARAMETERS — Cortés-Arcos et al. (2020) Eq. 23, Version 2 Cyclic
 # κ = Cost_bat / Q_lifetime_MWh  [£/MWh]
-# Derivation:
-#   Cost_bat      = £200/kWh × 372.7 kWh = £74,540
-#   N_cycles      = 3,500 (CATL EnerOne datasheet, 1C to 80% capacity)
+#
+# Updated derivation for 2024/2025 CATL EnerOne 280Ah LFP at 0.5C:
+#   Cost_bat      = £120/kWh × 372.7 kWh = £44,724
+#                   (BNEF LCOE 2024; BEIS Energy Storage Capital Cost Report 2024:
+#                    £100–150/kWh installed for utility-scale LFP BESS)
+#   N_cycles      = 8,000 (CATL EnerOne at 0.5C, DoD=80%, to 80% retained capacity;
+#                    LFP cycle life at moderate C-rates: 6,000–10,000 cycles)
 #   DoD           = 0.80  (SoC_min=0.1, SoC_max=0.9)
-#   Q_lifetime    = 3500 × 2 × 0.80 × 372.7 kWh / 1000 = 2,087 MWh (bidirectional)
-#   κ             = £74,540 / 2,087 = £35.7/MWh → 35.0 £/MWh
+#   Q_lifetime    = 8000 × 2 × 0.80 × 372.7 kWh / 1000 = 4,770 MWh (bidirectional)
+#   κ             = £44,724 / 4,770 = £9.38/MWh → 10.0 £/MWh
+#
+# Previous value (£35/MWh) used 2022 cell costs (£200/kWh) and 1C cycle life
+# (3,500 cycles). This made cycling unprofitable below ~£70/MWh daily spreads,
+# causing the agent to rationally idle in the 2025 test set.
 # ======
-deg_kappa = 35.0
+deg_kappa = 10.0
+
+scales = compute_scales(train_ratio=0.70, train_start=None)
 
 # CARBON Thresholds
 
@@ -65,7 +86,7 @@ scale_numeric = 5.0
 # POWER AND TIMING PARAMETERS
 # ========
 C_rate = 0.5  # C-rate (0.5C = 2-hour discharge)
-P_max_MW = C_rate * E_max  # MW (power step: P_step = 0.5C × E_nominal = 0.18635 MW)
+P_max_MW = 0.5 * E_max  # MW (C-rate 0.5 scales with energy: 0.5 × 0.0999 MWh = 0.04995 MW ≈ 49.9 MW)
 dt = 0.5  # hours (timestep = 30 minutes)
 
 # For discrete action space, we need to define the number of power levels

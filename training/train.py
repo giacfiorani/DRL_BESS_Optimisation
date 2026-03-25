@@ -21,7 +21,7 @@ from agents.hyperparams import DQN_HYPERPARAMS, DDQN_HYPERPARAMS, D3QN_HYPERPARA
 # ============================================================
 # REPRODUCIBILITY SEEDS — 5-seed averaging for academic robustness
 # ============================================================
-SEEDS = [0, 1, 2, 3, 4, 42]
+SEEDS = [0, 1, 2, 3, 4]
 
 # ============================================================
 # STEP-LEVEL MONITORING
@@ -68,7 +68,7 @@ def build_agent(agent_name: str, hp: dict):
     )
 
 
-def train(agent_name: str, run_id: int, seed: int = 42, resume_path: str = None):
+def train(agent_name: str, run_id: int, seed: int = 42, resume_path: str = None, train_start: str = None):
     hp = HYPERPARAMS_MAP[agent_name]
 
     # Freeze all randomness for reproducibility
@@ -78,9 +78,12 @@ def train(agent_name: str, run_id: int, seed: int = 42, resume_path: str = None)
     if T.backends.mps.is_available():
         T.mps.manual_seed(seed)
 
+    # 2. Update run_name to include the start date (helps in TensorBoard)
+    start_label = train_start if train_start else "2022"
     run_name = (
         f"{run_id:02d}_{agent_name.upper()}"
         f"_seed{seed}"
+        f"_start{start_label}" 
         f"_lci{hp['lambda_ci']}"
         f"_lr{hp['lr']}"
         f"_g{hp['gamma']}"
@@ -89,6 +92,7 @@ def train(agent_name: str, run_id: int, seed: int = 42, resume_path: str = None)
     os.makedirs(f"models/{run_name}", exist_ok=True)
 
     writer = SummaryWriter(f"runs/{run_name}")
+    # 3. Pass train_start into BatteryEnv
     env = BatteryEnv(
         config=env_config,
         lambda_ci=hp["lambda_ci"],
@@ -96,6 +100,7 @@ def train(agent_name: str, run_id: int, seed: int = 42, resume_path: str = None)
         randomize_init_soc=True,
         randomize_start=True,
         seed=seed,
+        train_start=train_start,
     )
     agent = build_agent(agent_name, hp)
 
@@ -337,6 +342,20 @@ if __name__ == "__main__":
         default=None,
         help="Path to a .pth checkpoint to resume from (single-seed runs only)",
     )
+    parser.add_argument(
+        "--kappa",
+        type=float,
+        default=None,
+        help="Override degradation cost κ (£/MWh) for ablation study",
+    )
+    parser.add_argument(
+        "--lambda-ci",
+        type=float,
+        default=None,
+        help="Override carbon penalty weight λ_ci for ablation study",
+    )
+    parser.add_argument("--train-start", type=str, default=None,
+                    help="Optional: exclude data before this date (e.g. 2023-01-01)")
 
     args = parser.parse_args()
 
@@ -345,8 +364,24 @@ if __name__ == "__main__":
         for hp in HYPERPARAMS_MAP.values():
             hp["n_episodes"] = args.n_episodes
 
+    if args.kappa is not None:
+        env_config.deg_kappa = args.kappa
+        print(f"  [ABLATION] deg_kappa overridden to {args.kappa} £/MWh")
+
+    if args.lambda_ci is not None:
+        for hp in HYPERPARAMS_MAP.values():
+            hp["lambda_ci"] = args.lambda_ci
+        print(f"  [ABLATION] lambda_ci overridden to {args.lambda_ci}")
+
     for seed in args.seeds:
         print(f"\n{'='*60}")
-        print(f"  {args.agent.upper()} | seed={seed}")
+        print(f"  {args.agent.upper()} | seed={seed} | start={args.train_start or 'Default'}")
         print(f"{'='*60}")
-        train(args.agent, args.run_id, seed=seed, resume_path=args.resume_path)
+        
+        train(
+            args.agent, 
+            args.run_id, 
+            seed=seed, 
+            resume_path=args.resume_path, 
+            train_start=args.train_start # Final step in the pipeline
+        )

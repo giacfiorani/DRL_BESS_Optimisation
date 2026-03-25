@@ -20,8 +20,13 @@ class DeepQNetwork(nn.Module):
         # (Huber Loss) because it prevents crazy gradients if the agent makes a huge mistake early on.
         self.loss = nn.SmoothL1Loss()
 
-        # Device mapping
-        self.device = T.device('cuda:0' if T.cuda.is_available() else 'cpu')
+        # Device mapping (MPS for Apple Silicon, CUDA for NVIDIA, else CPU)
+        if T.backends.mps.is_available():
+            self.device = T.device('mps')
+        elif T.cuda.is_available():
+            self.device = T.device('cuda:0')
+        else:
+            self.device = T.device('cpu')
         self.to(self.device)
 
     # Handling forward propagation

@@ -4,6 +4,7 @@ import numpy as np
 from gymnasium import Env, spaces
 from pathlib import Path
 from envs.degradation import ThroughputDegradation
+from envs.reward_scaling import compute_scales
 
 class BatteryEnv(Env):
 
@@ -45,13 +46,13 @@ class BatteryEnv(Env):
         split: str = "train",       # "train" | "val" | "test"
         train_ratio: float = 0.70,
         val_ratio: float = 0.15,
-        continuous_action: bool = False, #Continuous vs Discrete Environment
+        train_start: str | None = None,
+        continuous_action: bool = False, 
     ):
-        # env initialisation
         super().__init__()
 
         # -----------------
-        # Config
+        # Basic Parameters
         # -----------------
         self.publish_hour = int(publish_hour)
         self.episode_days = int(episode_days)
@@ -59,153 +60,123 @@ class BatteryEnv(Env):
         self.randomize_start    = bool(randomize_start)
         self.np_random = np.random.default_rng(seed)
         self.continuous_action = continuous_action
+        self.train_start = train_start
 
         # ========
-        # 1. HARDWARE & MDP PARAMETERS
+        # 1. HARDWARE & PHYSICS (Scaled for 268 Cabinets)
         # ========
-        # CATL EnerOne 1P416S
         self.N_cells = config.N_cells
-        # Pack charge (Coulombs): 280 Ah * 3600 s/h
-        self.Q_pack_C = config.Q_cell_C # 1,008,000 C - Since 1P416S Q_cell = Q_pack
-        self.V_nominal = config.V_nominal  # V
-        self.E_nominal = config.E_nominal  # kWh
+        self.Q_pack_C = config.Q_cell_C 
+        self.V_nominal = config.V_nominal  
+        self.E_nominal = config.E_nominal  
+        self.E_max = config.E_max  # MWh
 
-        # Operational limits (from your MDP)
         self.SoC_min = config.SoC_min
         self.SoC_max = config.SoC_max
         self.SoC_initial = float(config.SoC_initial)
 
-        # Time step: 30 minutes
         self.dt_hours = config.dt
         self.dt_seconds = self.dt_hours * 3600.0
+        self.eta_ch = config.eff_ch   
+        self.eta_dis = config.eff_dis    
 
-        # Efficiencies
-        self.eta_ch = config.eff_ch   # charge efficiency
-        self.eta_dis = config.eff_dis    # discharge efficiency
-
-        # Power / action scaling
         self.P_max_MW = config.P_max_MW
         self.n_power_levels = config.n_power_levels
-
-        # Reward config: carbon weight λ
         self.lambda_ci = lambda_ci
         
-        # ECM R-int model parameter (internal resistance)
-        self.R_cell_mOhm = config.R_cell_mOhm  # mΩ per cell
-        self.R_sys = (self.R_cell_mOhm / 1000.0) * self.N_cells  # Ω (pack resistance)
+        # ECM Resistance logic
+        self.R_cell_mOhm = config.R_cell_mOhm  
+        self.N_cabinets = config.N_cabinets  
+        R_cabinet_ohm = (self.R_cell_mOhm / 1000.0) * self.N_cells
+        self.R_sys = R_cabinet_ohm / self.N_cabinets  
 
-        # Init SoC range defaults to your operational limits
-        self.init_soc_low = float(self.SoC_min if init_soc_low is None else init_soc_low)
-        self.init_soc_high = float(self.SoC_max if init_soc_high is None else init_soc_high)
-
-        #Scaling Factors for Profit and Carbon Penalty rewards
-        self.profit_scale = float(config.S_profit)
-        self.carbon_scale = float(config.S_carbon_gbp)
-        self.price_scale = float(config.S_price)
-        self.ci_scale = float(config.S_ci)
-
-        #Degradation parameters
+        # Degradation
         self.deg_kappa = float(config.deg_kappa)
-
-        # Instantiate Degradation Model — Cortés-Arcos et al. (2020) Eq. 23
         self.degradation_model = ThroughputDegradation(self.deg_kappa)
 
-        self.E_max = config.E_max  # MWh - rated capacity (0.3727 from env_config)
-
+        # Operational parameters
         self.alpha_thresh = config.alpha_thresh
         self.monthly_budget = config.monthly_budget  
         self.scale_numeric = config.scale_numeric
 
+        self.init_soc_low = float(init_soc_low if init_soc_low is not None else self.SoC_min)
+        self.init_soc_high = float(init_soc_high if init_soc_high is not None else self.SoC_max)
+
+        # ========
+        # 2. DYNAMIC REWARD SCALING & DATA LOADING
+        # ========
+        
+        # This function now respects train_start (e.g., excluding 2022 price spikes)
+        scales = compute_scales(train_ratio=train_ratio, train_start=self.train_start)
+        
+        self.profit_scale = float(scales["S_profit"])
+        self.carbon_scale = float(scales["S_carbon_gbp"])
+        self.price_scale = float(scales["S_price"])
+        self.ci_scale = float(scales["S_ci"])
+        
+        # Universal scaler for interpretable logs (£/MWh normalization)
         self.scale_universal = self.profit_scale / self.E_max
 
-        # ========
-        # Read from OCV Lookup Table and Interpolate to get OCV-SOC Curve
-        # ========
-        self.ocv_soc_points, self.ocv_cell_volts = config.ocv_lookup_table()
-        
-        # ========
-        # 2. LOAD DATA
-        # ========
-        # trade_ts: time at which DA information becomes available (trade day D-1)
-        # delivery_ts: physical electricity delivery half-hour (delivery day D)
-        # The agent steps forward in delivery_ts, not trade_ts
+        print(f"--- ENV INITIALIZED ---")
+        print(f"Target Start Date: {self.train_start}")
+        print(f"Actual S_profit being used for rewards: £{self.profit_scale:.2f}")
 
+        # Load raw data
         ROOT_DIR = Path(__file__).resolve().parents[1]
         DATA_PATH = ROOT_DIR / "data" / "data.parquet"
         df = pd.read_parquet(DATA_PATH).copy()
 
-        df["trade_ts"] = pd.to_datetime(df["trade_ts"])
         df["delivery_ts"] = pd.to_datetime(df["delivery_ts"])
-        df["trade_date"] = pd.to_datetime(df["trade_date"])
         df["delivery_date"] = pd.to_datetime(df["delivery_date"]).dt.floor("D")
 
-        # Index on delivery timestamp
+        # --- DATA WINDOWING ---
+        # If train_start is set (e.g. '2023-07-01'), discard all data before that date.
+        # This ensures the splits (70/15/15) only apply to the representative window.
+        if self.train_start is not None:
+            start_dt = pd.Timestamp(self.train_start)
+            df = df[df["delivery_ts"] >= start_dt].copy()
+
         df = df.sort_values("delivery_ts").reset_index(drop=True)
 
-        self.df = df
-
-        # Arrays for fast access
-        self.trade_ts = df["trade_ts"].to_numpy(dtype="datetime64[ns]")
+        # Map numpy arrays for high-speed indexing
+        self.id_price = df["mid_price_gbp_mwh"].to_numpy(dtype=np.float32)
+        self.da_price = df["da_price_gbp_mwh"].to_numpy(dtype=np.float32)
+        self.ci = df["ci_actual_gco2_kwh"].to_numpy(dtype=np.float32)
+        self.ci_forecast = df["ci_forecast_gco2_kwh"].to_numpy(dtype=np.float32)
+        self.mef = df["mef_gco2_kwh"].to_numpy(dtype=np.float32)
+        self.carbon_price = df["uka_gbp_tco2"].to_numpy(dtype=np.float32)
         self.delivery_ts = df["delivery_ts"].to_numpy(dtype="datetime64[ns]")
-        self.trade_date = df["trade_date"].to_numpy(dtype="datetime64[ns]")
         self.delivery_date = df["delivery_date"].to_numpy(dtype="datetime64[ns]")       
-        self.tau = df["tau"].to_numpy(dtype=np.int32)  # 1..48
-        self.id_price = df["mid_price_gbp_mwh"].to_numpy(dtype=np.float32) # intraday prices data
-        self.da_price = df["da_price_gbp_mwh"].to_numpy(dtype=np.float32) # day ahead prices data
-        self.ci = df["ci_actual_gco2_kwh"].to_numpy(dtype=np.float32) # carbon intensity data (actual)
-        self.ci_forecast = df["ci_forecast_gco2_kwh"].to_numpy(dtype=np.float32) # forecaste Carbon intensity data
-        self.mef = df["mef_gco2_kwh"].to_numpy(dtype=np.float32) # Marginal Emissions Factor data
-        self.carbon_price = df["uka_gbp_tco2"].to_numpy(dtype=np.float32) # carbon price
+        self.tau = df["tau"].to_numpy(dtype=np.int32)
 
-
-        # Precomputed Datetime Arrays
+        # Precompute DA availability
         self.tomorrow_day_arr = self.delivery_date.astype('datetime64[D]') + np.timedelta64(1, 'D')
         publish_ts_arr = self.tomorrow_day_arr - np.timedelta64(1,'D') + np.timedelta64(self.publish_hour, 'h')
         self.da_avail_arr = (self.delivery_ts >= publish_ts_arr)
 
-        #====
-        # Group environment episodes by DELIVERY day (not trade day):
-        # • DA commitments apply to an entire delivery day (48 SPs)
-        # • MID prices and carbon intensity are realised at delivery time
-        # • Each episode day = one physical delivery day
-        #===
-        # inside __init__ after grouping
+        # Group into valid days (48 SPs each)
         day_to_idx = df.groupby("delivery_date").indices
-
         valid_days = []
         day_indices = {}
 
         for d, idxs in day_to_idx.items():
-            idxs = np.array(sorted(idxs), dtype=np.int64)
-
-            if len(idxs) != 48:
-                continue
-
-            taus = df.loc[idxs, "tau"].to_numpy()
-            if set(taus.tolist()) != set(range(1, 49)):
-                continue
-
-            ts_day = df.loc[idxs, "delivery_ts"].to_numpy(dtype="datetime64[ns]")
-            deltas = np.diff(ts_day).astype("timedelta64[m]").astype(int)
-            if not np.all(deltas == 30):
-                continue
-
-            # CANONICAL KEY: datetime64[D]
-            d64 = np.datetime64(pd.Timestamp(d).date(), "D")
-            valid_days.append(d64)
-            day_indices[d64] = idxs
+            if len(idxs) == 48:
+                d64 = np.datetime64(pd.Timestamp(d).date(), "D")
+                valid_days.append(d64)
+                day_indices[d64] = np.array(sorted(idxs), dtype=np.int64)
 
         self.valid_days = np.array(sorted(valid_days), dtype="datetime64[D]")
         self.day_indices = day_indices
+
         self.day_pos = {d: i for i, d in enumerate(self.valid_days)}
 
         # ========
-        # Chronological 70 / 15 / 15 train / val / test split
-        # Never shuffle — this is time-series data.
+        # 3. CHRONOLOGICAL SPLIT
         # ========
         n = len(self.valid_days)
         n_train = int(n * train_ratio)
         n_val   = int(n * val_ratio)
+        
         self.valid_days_train = self.valid_days[:n_train]
         self.valid_days_val   = self.valid_days[n_train : n_train + n_val]
         self.valid_days_test  = self.valid_days[n_train + n_val :]
@@ -213,82 +184,47 @@ class BatteryEnv(Env):
         _split_map = {"train": self.valid_days_train,
                       "val":   self.valid_days_val,
                       "test":  self.valid_days_test}
+        
         if split not in _split_map:
             raise ValueError(f"split must be 'train', 'val', or 'test'. Got: {split!r}")
+        
         self.split = split
         self.active_valid_days = _split_map[split]
 
         # ========
-        # 3) ACTION SPACE
+        # 4. ACTION & OBSERVATION SPACES
         # ========
-        # 1. CONTINUOUS 
-
-        # 2. DISCRETE
-        # Action space:
-        # [dispatch_idx, plan_idx, plan_slot]
-        #
-        # dispatch_idx:
-        #   Real-time physical dispatch request for the current delivery SP.
-        #
-        # plan_idx:
-        #   Power level to commit in the DA plan for a future delivery day.
-        #
-        # plan_slot:
-        #   Target settlement period (0..47) of tomorrow's DA plan to update.
-        #
-        # This allows the agent to gradually construct a full 48-slot DA schedule
-        # after the DA curve is published, while still dispatching in real time.
-
         self.power_levels = np.linspace(-self.P_max_MW, self.P_max_MW, self.n_power_levels).astype(np.float32)
 
         if self.continuous_action:
-            # PPO Mode: index 0 = real-time dispatch fraction [-1,1]
-            #           indices 1-48 = full 48-slot DA plan for tomorrow [-1,1] each
-            # Written atomically when da_avail=True, solving the 12:00 PM planning crunch.
             self.action_space = gym.spaces.Box(low=-1.0, high=1.0, shape=(49,), dtype=np.float32)
         else:
-            # Discrete Mode: [dispatch_idx, plan_idx, plan_slot]
             self.action_space = gym.spaces.MultiDiscrete([self.n_power_levels, self.n_power_levels, 48])
             
-        # ========
-        # 4) OBSERVATION SPACE
-        # ========
-        # obs = [SoC, spot_price_now, CI_now, tau_now, P_prev, da_available] + tomorrow_DA_curve_48
+        # Observation space (103 floats)
         low_main  = np.array([0.0, -500.0, 0.0, 1.0, -self.P_max_MW, 0.0, -self.P_max_MW], dtype=np.float32)
         high_main = np.array([1.0, 7000.0, 1000.0, 48.0,  self.P_max_MW, 1.0,  self.P_max_MW], dtype=np.float32)
+        low_da = np.full((48,), -500.0, dtype=np.float32)
+        high_da = np.full((48,), 7000.0, dtype=np.float32)
+        low_ci = np.full((48,), 0.0, dtype=np.float32)
+        high_ci = np.full((48,), 1000.0, dtype=np.float32)
 
-        # these define the min/max limits for each of the 48 entries of the “tomorrow DA price curve” that are included in the observation.
-        low_da_curve = np.full((48,), -500.0, dtype=np.float32)
-        high_da_curve = np.full((48,), 7000.0, dtype=np.float32)
-
-        # tomorrow CI curve bounds (gCO2/kWh)
-        low_ci_da_curve  = np.full((48,), 0.0, dtype=np.float32)
-        high_ci_da_curve = np.full((48,), 1000.0, dtype=np.float32)
-
-        # Total Obs length = 48 + 7 + 48 = 103 floats
         self.observation_space = gym.spaces.Box(
-            low=np.concatenate([low_main, low_da_curve, low_ci_da_curve]),
-            high=np.concatenate([high_main, high_da_curve, high_ci_da_curve]),
+            low=np.concatenate([low_main, low_da, low_ci]),
+            high=np.concatenate([high_main, high_da, high_ci]),
             dtype=np.float32,
         )
 
-        # ========
-        # 5) INTERNAL ENV VARIABLES
-        # ========
+        # OCV Lookup
+        self.ocv_soc_points, self.ocv_cell_volts = config.ocv_lookup_table()
+        
+        # State init
         self.soc = float(self.SoC_initial)
         self.p_prev = 0.0
-
         self.days_done = 0
         self.current_day = None
-        self.current_day_idxs = None
-        self.slot0 = 0  # 0..47
-
-        # Rolling plans (discrete mode — integer power-level indices)
-        self.today_plan = np.full(48, -1, dtype=np.int32)  # -1 means “no commitment”
+        self.today_plan = np.full(48, -1, dtype=np.int32)
         self.tomorrow_plan = np.full(48, -1, dtype=np.int32)
-
-        # Continuous mode plan arrays (MW values, not indices)
-        # Always allocated to avoid conditional init; only written in continuous mode.
         self.today_plan_continuous    = np.zeros(48, dtype=np.float32)
         self.tomorrow_plan_continuous = np.zeros(48, dtype=np.float32)
 
