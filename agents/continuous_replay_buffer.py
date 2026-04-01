@@ -6,14 +6,14 @@ class ContinuousReplayBuffer:
     Adapted for Continuous Action Spaces (Float32).
     """
 
-    def __init__(self, max_size, obs_dim=103, act_dim=49):
+    def __init__(self, max_size, obs_dim=103, act_dim=3):
         self.max_size = max_size
         self.ptr = 0       # write pointer
         self.size = 0      # current fill level
 
         self.states      = np.zeros((max_size, obs_dim), dtype=np.float32)
         
-        #  Action array 2D and Float32 
+        #  Action array 3D and Float32
         self.actions     = np.zeros((max_size, act_dim), dtype=np.float32)
         
         self.rewards     = np.zeros(max_size,            dtype=np.float32)

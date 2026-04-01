@@ -34,11 +34,13 @@ from agents.dqn_agent import DQNAgent
 from agents.ddqn_agent import DDQNAgent
 from agents.d3qn import D3QNAgent
 from agents.d3qn_per_agent import D3QNPERAgent
+from agents.sac_agent import SACAgent
 from agents.hyperparams import (
     DQN_HYPERPARAMS,
     DDQN_HYPERPARAMS,
     D3QN_HYPERPARAMS,
     D3QN_PER_HYPERPARAMS,
+    SAC_HYPERPARAMS,
 )
 from utils.action_encoding import decode, N_ACTIONS
 
@@ -70,6 +72,7 @@ COLORS = {
     'idle': '#9467bd',        # purple
     'random': '#8c564b',      # brown
     'p20p80': '#e377c2',      # pink
+    'sac': '#17becf',          # cyan
 }
 
 # ============================================================
@@ -89,6 +92,7 @@ AGENTS: dict[str, type] = {
     "ddqn":     DDQNAgent,
     "d3qn":     D3QNAgent,
     "d3qn_per": D3QNPERAgent,
+    "sac":      SACAgent,
 }
 
 HYPERPARAMS_MAP: dict[str, dict] = {
@@ -96,6 +100,7 @@ HYPERPARAMS_MAP: dict[str, dict] = {
     "ddqn":     DDQN_HYPERPARAMS,
     "d3qn":     D3QN_HYPERPARAMS,
     "d3qn_per": D3QN_PER_HYPERPARAMS,
+    "sac":      SAC_HYPERPARAMS,
 }
 
 os.makedirs(RESULTS_DIR, exist_ok=True)
@@ -110,15 +115,21 @@ def load_frozen_agent(agent_name: str, seed: int,
                       checkpoint_dir: str = CHECKPOINT_DIR) -> object:
     """
     Load a trained checkpoint and return a fully greedy agent (epsilon=0).
+    Prefers best_val_model.pth (validation-selected); falls back to final_model.pth.
     """
     agent_cls = AGENTS[agent_name]
     hp = HYPERPARAMS_MAP[agent_name]
 
-    search_pattern = f"{checkpoint_dir}/*_{agent_name.upper()}_seed{seed}_*/final_model.pth"
-    matching_file = glob(search_pattern)
+    # Prefer validation-selected model; fall back to final
+    search_best = f"{checkpoint_dir}/*_{agent_name.upper()}_seed{seed}_*/best_val_model.pth"
+    search_final = f"{checkpoint_dir}/*_{agent_name.upper()}_seed{seed}_*/final_model.pth"
+    matching_file = glob(search_best) or glob(search_final)
 
     if len(matching_file) == 0:
-        raise FileNotFoundError(f"Could not find trained model for {agent_name} seed {seed}. Pattern: {search_pattern}")
+        raise FileNotFoundError(
+            f"Could not find trained model for {agent_name} seed {seed}. "
+            f"Patterns tried: {search_best}, {search_final}"
+        )
 
     ckpt_path = matching_file[0]
     print(f"Found model: {ckpt_path}")
@@ -144,10 +155,67 @@ def load_frozen_agent(agent_name: str, seed: int,
     return agent
 
 
-def build_test_env(lambda_ci: float = 0.9) -> BatteryEnv:
+def load_frozen_sac_agent(seed: int,
+                          checkpoint_dir: str = CHECKPOINT_DIR) -> SACAgent:
+    """Load a trained SAC checkpoint (best_val_model.pth) for greedy evaluation."""
+    hp = SAC_HYPERPARAMS
+
+    # Prefer best_val_model.pth; fall back to final_model.pth
+    search_best = f"{checkpoint_dir}/*_SAC_seed{seed}_*/best_val_model.pth"
+    search_final = f"{checkpoint_dir}/*_SAC_seed{seed}_*/final_model.pth"
+    matching = glob(search_best) or glob(search_final)
+
+    if not matching:
+        raise FileNotFoundError(
+            f"No SAC model found for seed {seed}. "
+            f"Patterns tried: {search_best}, {search_final}"
+        )
+
+    ckpt_path = matching[0]
+    print(f"Found SAC model: {ckpt_path}")
+
+    agent = SACAgent(
+        gamma=hp["gamma"],
+        tau=hp["tau"],
+        lr=hp["lr"],
+        alpha_lr=hp["alpha_lr"],
+        batch_size=hp["batch_size"],
+        reward_scale=hp["reward_scale"],
+        input_dims=INPUT_DIMS,
+        n_actions=3,
+    )
+
+    ckpt = T.load(ckpt_path, map_location="cpu")
+    agent.actor.load_state_dict(ckpt["actor_state_dict"])
+    agent.actor.eval()
+
+    return agent
+
+
+def run_continuous_rollout_sac(agent: SACAgent, env: BatteryEnv) -> pd.DataFrame:
+    """Run a greedy 219-day SAC rollout using deterministic (mean) policy."""
+    obs, info = env.reset(options={"delivery_day": TEST_START_DATE})
+
+    rows = []
+    step_idx = 0
+    done = False
+
+    while not done:
+        action = agent.choose_action_deterministic(obs)
+        obs, reward, terminated, truncated, info = env.step(action)
+
+        rows.append({**info, "step": step_idx, "reward": reward})
+
+        step_idx += 1
+        done = terminated or truncated
+
+    return pd.DataFrame(rows)
+
+
+def build_test_env(lambda_ci: float = 0.9, continuous_action: bool = False) -> BatteryEnv:
     """
     Create a deterministic BatteryEnv for the 219-day test split.
-    Supports lambda_ci ablation.
+    Supports lambda_ci ablation. Set continuous_action=True for SAC.
     """
     env = BatteryEnv(
         config=env_config,
@@ -156,8 +224,9 @@ def build_test_env(lambda_ci: float = 0.9) -> BatteryEnv:
         episode_days=N_TEST_DAYS,
         randomize_init_soc=False,
         randomize_start=False,
+        continuous_action=continuous_action,
         seed=SEED,
-        train_start="2023-01-01" 
+        train_start="2023-01-01"
     )
     return env
 
@@ -662,7 +731,7 @@ def plot_agent_vs_baselines_bar(all_results: dict[str, pd.DataFrame],
 
         net_profit = df["actual_reward"].sum()
         
-        efc = df["P_applied_MW"].abs().sum() * 0.5 / 0.3727
+        efc = df["P_applied_MW"].abs().sum() * 0.5 / 100
         net_carbon = df["net_carbon_tCO2"].sum()
 
         baseline_metrics[baseline_name] = {
@@ -689,7 +758,7 @@ def plot_agent_vs_baselines_bar(all_results: dict[str, pd.DataFrame],
 
             # Calculate for THIS SEED ONLY
             net_profit = df["actual_reward"].sum()
-            efc = df_seed["P_applied_MW"].abs().sum() * 0.5 / 0.3727
+            efc = df_seed["P_applied_MW"].abs().sum() * 0.5 / 100
             net_carbon = df_seed["net_carbon_tCO2"].sum()
 
             seed_profits.append(net_profit)
@@ -1387,7 +1456,7 @@ def plot_theme_a_financial(all_results: dict, all_kpis: dict, agent_names: list,
         if baseline_name in all_results:
             df = all_results[baseline_name]
             net_profit = df["actual_reward"].sum()
-            efc = df["P_applied_MW"].abs().sum() * 0.5 / 0.3727
+            efc = df["P_applied_MW"].abs().sum() * 0.5 / 100
             net_carbon = df["net_carbon_tCO2"].sum()
             baseline_metrics[baseline_name] = {
                 "Net Profit (£)": net_profit,
@@ -2028,9 +2097,10 @@ def plot_theme_d_regime(all_results: dict, all_kpis: dict, agent_names: list,
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="BESS RL Evaluation — IEEE Publication Grade")
-    parser.add_argument("--agents", nargs="+", type=str, default=list(AGENTS.keys()),
+    parser.add_argument("--agents", nargs="+", type=str,
+                       default=[k for k in AGENTS.keys() if k != "sac"],
                        choices=list(AGENTS.keys()),
-                       help="Agent(s) to evaluate")
+                       help="Agent(s) to evaluate (use --agents sac for SAC)")
     parser.add_argument("--seeds", nargs="+", type=int, default=[0, 1, 2, 3, 4],
                        help="Seeds to evaluate per agent")
     parser.add_argument("--lambda-values", nargs="+", type=float, default=[0.0, 0.1, 0.3, 0.5, 1.0],
@@ -2078,9 +2148,14 @@ if __name__ == "__main__":
                 label = f"{agent_name}_lambda{lambda_ci:.1f}_seed{seed}"
                 print(f"\n -> Evaluating {label}...")
                 try:
-                    agent = load_frozen_agent(agent_name, seed)
-                    env = build_test_env(lambda_ci=lambda_ci)
-                    df = run_continuous_rollout(agent, env)
+                    if agent_name == "sac":
+                        agent = load_frozen_sac_agent(seed)
+                        env = build_test_env(lambda_ci=lambda_ci, continuous_action=True)
+                        df = run_continuous_rollout_sac(agent, env)
+                    else:
+                        agent = load_frozen_agent(agent_name, seed)
+                        env = build_test_env(lambda_ci=lambda_ci)
+                        df = run_continuous_rollout(agent, env)
                     df = add_derived_columns(df)
                     save_step_csv(df, agent_name, seed, lambda_ci=lambda_ci)
 

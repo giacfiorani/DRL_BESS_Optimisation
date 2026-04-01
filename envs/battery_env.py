@@ -197,7 +197,8 @@ class BatteryEnv(Env):
         self.power_levels = np.linspace(-self.P_max_MW, self.P_max_MW, self.n_power_levels).astype(np.float32)
 
         if self.continuous_action:
-            self.action_space = gym.spaces.Box(low=-1.0, high=1.0, shape=(49,), dtype=np.float32)
+            # 3-D action space: [dispatch_power, da_planning_power_frac, da_aggressiveness]
+            self.action_space = gym.spaces.Box(low=-1.0, high=1.0, shape=(3,), dtype=np.float32)
         else:
             self.action_space = gym.spaces.MultiDiscrete([self.n_power_levels, self.n_power_levels, 48])
             
@@ -227,6 +228,7 @@ class BatteryEnv(Env):
         self.tomorrow_plan = np.full(48, -1, dtype=np.int32)
         self.today_plan_continuous    = np.zeros(48, dtype=np.float32)
         self.tomorrow_plan_continuous = np.zeros(48, dtype=np.float32)
+        self.tomorrow_plan_locked    = False  # latch: one DA commit per day
 
 
     # =========
@@ -349,6 +351,53 @@ class BatteryEnv(Env):
             return np.zeros(48, dtype=np.float32)
         return self._get_ci_curve_for_delivery_day(tomorrow_day)
     
+    # ========
+    # DA PLAN EXPANSION (3-D continuous action space)
+    # ========
+    def _expand_da_plan(self, aggressiveness_raw: float, power_frac_raw: float, idx: int):
+        """
+        Expand aggressiveness + planning power fraction into a 48-slot DA schedule
+        using rank-based percentile thresholds.
+
+        α ∈ [0, 1] (from aggressiveness_raw):
+            α = 0  → no DA commitment (pure ID trading)
+            α = 1  → maximum commitment (all slots activated)
+
+        P_plan_base ∈ [0, P_max] (from power_frac_raw):
+            Controls the MW magnitude of each activated slot.
+            Discharge slots get +P_plan_base, charge slots get -P_plan_base.
+
+        Discharge candidates = top α/2 fraction of DA prices (most expensive)
+        Charge candidates    = bottom α/2 fraction of DA prices (cheapest)
+        SoC-feasible via forward simulation.
+        """
+        alpha = (float(np.clip(aggressiveness_raw, -1.0, 1.0)) + 1.0) / 2.0
+        P_plan_base = (float(np.clip(power_frac_raw, -1.0, 1.0)) + 1.0) / 2.0 * self.P_max_MW
+
+        da_prices = self._get_tomorrow_da_curve(idx)
+
+        # Rank: 0.0 = cheapest slot, 1.0 = most expensive slot
+        order = np.argsort(np.argsort(da_prices))
+        ranks = order.astype(np.float32) / max(len(da_prices) - 1, 1)
+
+        discharge_mask = ranks > (1.0 - alpha / 2.0)
+        charge_mask    = ranks < (alpha / 2.0)
+
+        # Forward-simulate SoC chronologically for feasibility
+        plan = np.zeros(48, dtype=np.float32)
+        sim_soc = self.soc
+        delta_per_slot = (P_plan_base * self.dt_hours) / self.E_max
+
+        for s in range(48):
+            if discharge_mask[s] and sim_soc - delta_per_slot >= self.SoC_min:
+                plan[s] = P_plan_base
+                sim_soc -= delta_per_slot
+            elif charge_mask[s] and sim_soc + delta_per_slot <= self.SoC_max:
+                plan[s] = -P_plan_base
+                sim_soc += delta_per_slot
+
+        self.tomorrow_plan_continuous[:] = plan
+
     # Observation consists of:
     # • current SoC
     # • intraday (MID) price for this delivery half-hour
@@ -425,6 +474,7 @@ class BatteryEnv(Env):
         # continuous mode plan rollover
         self.today_plan_continuous[:] = self.tomorrow_plan_continuous
         self.tomorrow_plan_continuous[:] = 0.0
+        self.tomorrow_plan_locked = False  # unlock for next day's DA commit
 
         # advance to next delivery day in dataset
         pos = self.day_pos[self.current_day]
@@ -453,14 +503,18 @@ class BatteryEnv(Env):
         tomorrow_exists = tomorrow_day in self.day_indices
 
         if self.continuous_action:
-            # --- Continuous Action Parsing ---
-            # action[0]    : real-time dispatch fraction ∈ [-1, 1] → scaled to [-P_max, P_max]
-            # action[1:49] : full 48-slot DA plan for tomorrow, written atomically when da_avail=True
+            # --- 3-D Continuous Action Parsing ---
+            # action[0]: real-time physical dispatch       [-1, 1] → [-P_max, P_max]
+            # action[1]: DA planning power fraction        [-1, 1] → [0, P_max]
+            # action[2]: DA commitment aggressiveness      [-1, 1] → α ∈ [0, 1]
             P_req_MW  = float(np.clip(action[0], -1.0, 1.0)) * self.P_max_MW
             P_plan_MW = float(self.today_plan_continuous[tau0])
-            if da_avail and tomorrow_exists:
-                raw = np.array(action[1:49], dtype=np.float32)
-                self.tomorrow_plan_continuous[:] = np.clip(raw, -1.0, 1.0) * self.P_max_MW
+
+            # Latch: expand DA plan once per day on first DA-available step
+            if da_avail and tomorrow_exists and not self.tomorrow_plan_locked:
+                self._expand_da_plan(action[2], action[1], idx)
+                self.tomorrow_plan_locked = True
+
             # sentinel values for info dict compatibility
             dispatch_idx = plan_idx = plan_slot = planned_idx = -1
         else:
@@ -514,7 +568,10 @@ class BatteryEnv(Env):
         E_import_kWh = max(-E_act_MWh, 0.0) * 1000.0
         E_export_kWh = max(E_act_MWh, 0.0) * 1000.0
 
-        net_tCO2 = (E_import_kWh * ci_now - E_export_kWh * mef_now) / 1e6  
+        # Symmetric AEF: both import and export use actual grid carbon intensity.
+        # mef_gco2_kwh was found to be a CCGT flatline (370 g/kWh for 99.96% of rows)
+        # with zero temporal variance, making the asymmetric formulation indefensible.
+        net_tCO2 = (E_import_kWh - E_export_kWh) * ci_now / 1e6
         carbon_cashflow_gbp = carbon_price_now * net_tCO2
 
         steps_per_month = 48 * 30 
@@ -528,8 +585,8 @@ class BatteryEnv(Env):
         # --- NEW DATA-DRIVEN LINEAR SCALING ---
         r_mwh = R_total_gbp / self.E_max
         r_step = r_mwh / self.scale_universal
-        reward = float(np.clip(r_step, -1.0, 1.0))
-        actual_reward = float(R_total_gbp) 
+        reward = float(r_step)
+        actual_reward = float(R_total_gbp)
 
         self.p_prev = float(P_applied_MW)
 
@@ -618,6 +675,7 @@ class BatteryEnv(Env):
         self.tomorrow_plan[:] = -1
         self.today_plan_continuous[:] = 0.0
         self.tomorrow_plan_continuous[:] = 0.0
+        self.tomorrow_plan_locked = False
 
         obs = self._get_obs()
         info = {

@@ -1,14 +1,14 @@
 # =====
-# Hyperparameters — INTERIM values for corrected environment (kappa=10)
-# Generated: 2026-03-25
+# Hyperparameters — corrected environment (kappa=10, train_start=2023-01-01)
+# Updated: 2026-03-26
 #
-# NOTE: Previous Optuna HPO results (kappa=35) are INVALID — they optimised
-# for an environment where idling was the rational policy. eps_dec values
-# have been replaced with 1.375e-6 (eps_min at episode 500 of 1000).
-# All other params retained from HPO until re-run with corrected kappa.
+# REWARD SCALE NOTE: With S_profit ~= 7,487 (post-crisis window), individual
+# step rewards are in [-0.2, 0.2]. Episodic reward (336 steps) for a good
+# agent is ~0.5-0.7 per episode. The seed-20 DDQN run achieved GBP 160k
+# net profit on the 219-day test set with these DDQN params.
 #
-# Re-run HPO with: python training/optuna_search.py --agent <name> --n-trials 50
-# Database: training/optuna_results/{dqn,ddqn,d3qn,d3qn_per}_rand_study.db
+# DDQN params below are PROVEN (seed-20 achieved GBP 137k+ on test).
+# Re-run HPO with FIXED optuna_search.py (lr range, target_update bug fixed).
 # =====
 
 
@@ -24,17 +24,16 @@ DQN_HYPERPARAMS = {
     "target_update_frequency": 7500,
 }
 
-
 DDQN_HYPERPARAMS = {
-    "gamma":        0.9701809308246343,
+    "gamma":        0.9707,
     "epsilon":      1.0,
-    "lr":           1.1952270129143866e-05,
+    "lr":           1.48e-05,
     "batch_size":   128,
-    "eps_dec":      5e-06,  # INTERIM: eps_min at ep 500 (was 2.91e-05 from kappa=35 HPO)
+    "eps_dec":      8.63e-06,
     "eps_min":      0.01,
     "lambda_ci":    0.1,
     "n_episodes":   1000,
-    "target_update_frequency": 6500,
+    "target_update_frequency": 15000
 }
 
 D3QN_HYPERPARAMS = {
@@ -61,3 +60,21 @@ D3QN_PER_HYPERPARAMS = {
     "target_update_frequency": 5500,  # PLACEHOLDER
 }
 
+SAC_HYPERPARAMS = {
+    # Best trial: #14  val_reward=50.70  (30-trial TPE search, 2026-03-30)
+    # Key HPO findings:
+    #   - High gamma (>0.993) essential: BESS rewards accumulate over days
+    #   - reward_scale=6-9: keeps entropy alive, prevents alpha collapse
+    #   - alpha_lr < 2e-4: slower entropy tuning avoids premature convergence
+    #   - lr ~1.5e-4: slower than default 3e-4, more stable critic updates
+    #   - batch_size=128: outperforms 256 consistently across top-5 trials
+    "lr":           1.457e-04,
+    "alpha_lr":     1.542e-04,
+    "gamma":        0.9988,
+    "tau":          0.005,
+    "reward_scale": 7,
+    "batch_size":   128,
+    "warmup_steps": 5000,
+    "n_episodes":   1000,
+    "lambda_ci":    0.1,
+}

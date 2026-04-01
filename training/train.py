@@ -52,6 +52,63 @@ AGENTS = {
 
 env_config = envs.env_config
 
+# ============================================================
+# VALIDATION DEFAULTS
+# ============================================================
+DEFAULT_VAL_INTERVAL = 50      # evaluate on val every N episodes
+DEFAULT_PATIENCE     = 200     # episodes without val improvement → early stop
+
+
+def evaluate_on_val(agent, hp, train_start=None):
+    """Run a single deterministic (epsilon=0) rollout over the entire validation split.
+    Returns (cumulative_reward, metrics_dict).
+    No transitions are stored — zero buffer contamination."""
+    val_env = BatteryEnv(
+        config=env_config,
+        lambda_ci=hp["lambda_ci"],
+        split="val",
+        episode_days=999,            # overridden below
+        randomize_init_soc=False,
+        randomize_start=False,
+        seed=42,
+        train_start=train_start,
+    )
+    # Set episode length to exactly the val period so we never cross into test
+    val_env.episode_days = len(val_env.active_valid_days)
+
+    # Save and override epsilon for greedy evaluation
+    original_epsilon = agent.epsilon
+    agent.epsilon = 0.0
+
+    obs, _ = val_env.reset()
+    done = False
+    cumulative_reward = 0.0
+    cumulative_profit_gbp = 0.0
+    cumulative_carbon_tco2 = 0.0
+    n_steps = 0
+
+    while not done:
+        action = agent.choose_action(obs)
+        dispatch_idx, plan_idx, plan_slot = decode(action)
+        env_action = np.array([dispatch_idx, plan_idx, plan_slot], dtype=np.int64)
+        obs, reward, terminated, truncated, info = val_env.step(env_action)
+        done = terminated or truncated
+        cumulative_reward += reward
+        cumulative_profit_gbp += info.get("R_total_gbp", 0.0)
+        cumulative_carbon_tco2 += info.get("net_carbon_tCO2", 0.0)
+        n_steps += 1
+
+    # Restore original epsilon
+    agent.epsilon = original_epsilon
+
+    metrics = {
+        "val_reward": cumulative_reward,
+        "val_profit_gbp": cumulative_profit_gbp,
+        "val_carbon_tco2": cumulative_carbon_tco2,
+        "val_steps": n_steps,
+    }
+    return cumulative_reward, metrics
+
 
 def build_agent(agent_name: str, hp: dict):
     cls = AGENTS[agent_name]
@@ -68,7 +125,9 @@ def build_agent(agent_name: str, hp: dict):
     )
 
 
-def train(agent_name: str, run_id: int, seed: int = 42, resume_path: str = None, train_start: str = None):
+def train(agent_name: str, run_id: int, seed: int = 42, resume_path: str = None,
+          train_start: str = None, val_interval: int = DEFAULT_VAL_INTERVAL,
+          patience: int = DEFAULT_PATIENCE):
     hp = HYPERPARAMS_MAP[agent_name]
 
     # Freeze all randomness for reproducibility
@@ -124,6 +183,11 @@ def train(agent_name: str, run_id: int, seed: int = 42, resume_path: str = None,
     global_step = 0
     scores = []
     log_this_episode = False   # set per episode below
+
+    # --- Validation-based model selection ---
+    best_val_reward = -float('inf')
+    best_val_episode = -1
+    patience_counter = 0
 
     for i in range(start_episode, hp["n_episodes"]):
         obs, info = env.reset()
@@ -284,7 +348,8 @@ def train(agent_name: str, run_id: int, seed: int = 42, resume_path: str = None,
         print(f"[{agent_name.upper()}] Episode {i} | Score: {ep_reward:.2f} | "
               f"Avg: {avg_score:.2f} | ε: {agent.epsilon:.4f}")
 
-        if (i + 1) % 50 == 0:
+        if (i + 1) % val_interval == 0:
+            # --- Periodic checkpoint (unchanged) ---
             ckpt_path = f"models/{run_name}/checkpoint_ep{i+1}.pth"
             T.save({
                 'episode':            i,
@@ -292,7 +357,47 @@ def train(agent_name: str, run_id: int, seed: int = 42, resume_path: str = None,
                 'model_state_dict':   agent.Q_eval.state_dict(),
                 'optimizer_state_dict': agent.Q_eval.optimiser.state_dict(),
             }, ckpt_path)
-            print(f"  ✔ Checkpoint saved → {ckpt_path}")
+            print(f"  -> Checkpoint saved: {ckpt_path}")
+
+            # --- Validation evaluation ---
+            val_reward, val_metrics = evaluate_on_val(agent, hp, train_start)
+
+            writer.add_scalar("Val/Cumulative_Reward", val_reward, i)
+            writer.add_scalar("Val/Profit_GBP", val_metrics["val_profit_gbp"], i)
+            writer.add_scalar("Val/Carbon_tCO2", val_metrics["val_carbon_tco2"], i)
+
+            print(f"  [VAL] Episode {i+1} | Val Reward: {val_reward:.2f} | "
+                  f"Val Profit: £{val_metrics['val_profit_gbp']:.0f}")
+
+            # --- Best model selection ---
+            if val_reward > best_val_reward:
+                best_val_reward = val_reward
+                best_val_episode = i + 1
+                patience_counter = 0
+
+                best_path = f"models/{run_name}/best_val_model.pth"
+                T.save({
+                    'episode':              i,
+                    'epsilon':              agent.epsilon,
+                    'seed':                 seed,
+                    'agent':                agent_name,
+                    'model_state_dict':     agent.Q_eval.state_dict(),
+                    'optimizer_state_dict': agent.Q_eval.optimiser.state_dict(),
+                    'val_reward':           val_reward,
+                    'val_metrics':          val_metrics,
+                }, best_path)
+                print(f"  -> New best val model saved (reward={val_reward:.2f})")
+            else:
+                patience_counter += val_interval
+
+            # --- Optional early stopping ---
+            if patience_counter >= patience:
+                print(f"  [EARLY STOP] No val improvement for {patience} episodes. "
+                      f"Best at episode {best_val_episode}.")
+                break
+
+    print(f"\n  Training complete. Best validation model at episode {best_val_episode} "
+          f"with reward {best_val_reward:.2f}")
 
     final_path = f"models/{run_name}/final_model.pth"
     T.save({
@@ -356,6 +461,10 @@ if __name__ == "__main__":
     )
     parser.add_argument("--train-start", type=str, default=None,
                     help="Optional: exclude data before this date (e.g. 2023-01-01)")
+    parser.add_argument("--val-interval", type=int, default=DEFAULT_VAL_INTERVAL,
+                        help="Evaluate on val split every N episodes (default: 50)")
+    parser.add_argument("--patience", type=int, default=DEFAULT_PATIENCE,
+                        help="Early stop after N episodes without val improvement (default: 200)")
 
     args = parser.parse_args()
 
@@ -379,9 +488,11 @@ if __name__ == "__main__":
         print(f"{'='*60}")
         
         train(
-            args.agent, 
-            args.run_id, 
-            seed=seed, 
-            resume_path=args.resume_path, 
-            train_start=args.train_start # Final step in the pipeline
+            args.agent,
+            args.run_id,
+            seed=seed,
+            resume_path=args.resume_path,
+            train_start=args.train_start,
+            val_interval=args.val_interval,
+            patience=args.patience,
         )
