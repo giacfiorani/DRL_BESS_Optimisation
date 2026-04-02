@@ -571,7 +571,7 @@ class BatteryEnv(Env):
         # Symmetric AEF: both import and export use actual grid carbon intensity.
         # mef_gco2_kwh was found to be a CCGT flatline (370 g/kWh for 99.96% of rows)
         # with zero temporal variance, making the asymmetric formulation indefensible.
-        net_tCO2 = (E_import_kWh - E_export_kWh) * ci_now / 1e6
+        net_tCO2 = (E_import_kWh * ci_now - E_export_kWh * mef_now) / 1e6
         carbon_cashflow_gbp = carbon_price_now * net_tCO2
 
         steps_per_month = 48 * 30 

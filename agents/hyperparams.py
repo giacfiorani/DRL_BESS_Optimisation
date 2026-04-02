@@ -11,6 +11,7 @@
 # Re-run HPO with FIXED optuna_search.py (lr range, target_update bug fixed).
 # =====
 
+#NEED TO RUN HPO 
 
 DQN_HYPERPARAMS = {
     "gamma":        0.9781,
@@ -36,6 +37,7 @@ DDQN_HYPERPARAMS = {
     "target_update_frequency": 15000
 }
 
+# NEED TO RUN HPO
 D3QN_HYPERPARAMS = {
     "gamma":        0.9741490704098825,
     "epsilon":      1.0,
@@ -47,6 +49,8 @@ D3QN_HYPERPARAMS = {
     "n_episodes":   1000,
     "target_update_frequency": 7500,
 }
+
+# NEED TO RUN HPO
 
 D3QN_PER_HYPERPARAMS = {
     "gamma":        0.975,      # PLACEHOLDER — will update from trial results

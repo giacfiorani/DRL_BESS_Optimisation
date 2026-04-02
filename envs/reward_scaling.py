@@ -76,12 +76,17 @@ def compute_scales(
     S_profit = float(np.percentile(profit_series, 95))
 
     # ---- CARBON CASHFLOW scale (monetised, £) ----
-    # Symmetric AEF: net_tCO2 = (E_import - E_export) * ci / 1e6.
-    # Max magnitude per step is E_step_kWh * ci / 1e6 (charge-only or discharge-only).
-    # mef is no longer used in the reward formula.
+    # Asymmetric formulation matching battery_env.py:
+    # Import cost = E_step_kWh * ci_actual
+    # Export credit = E_step_kWh * mef_actual
     ci_abs  = df["ci_actual_gco2_kwh"].astype(float).abs().to_numpy()
+    mef_abs = df["mef_gco2_kwh"].astype(float).abs().to_numpy()
     uka_abs = df["uka_gbp_tco2"].astype(float).abs().to_numpy()
-    tco2_series = ci_abs * E_step_kWh / 1e6
+    
+    # We take the maximum possible magnitude per step (worst case ci or mef)
+    # to ensure the reward stays within a stable range [-1, 1].
+    max_intensity = np.maximum(ci_abs, mef_abs)
+    tco2_series = max_intensity * E_step_kWh / 1e6
     carbon_cashflow_series = uka_abs * tco2_series
     S_carbon_gbp = float(np.percentile(carbon_cashflow_series, 95))
 

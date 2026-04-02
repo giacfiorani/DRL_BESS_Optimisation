@@ -553,19 +553,23 @@ import datetime as dt
 import time
 import requests
 import pandas as pd
+import numpy as np
 
 BMRS_DATASET_BASE = "https://data.elexon.co.uk/bmrs/api/v1/datasets"
 
+# Emission factors for marginal generators (tCO2/MWh)
+EF_TCO2_PER_MWH = {
+    "CCGT": 0.37,
+    "COAL": 0.82,
+    "OIL": 0.65,
+}
+
 def fetch_fuelhh_range(start_date: str, end_date: str, sleep_s: float = 0.15) -> pd.DataFrame:
     """
-    Historical FUELHH pull using settlementDateFrom/To (matches your curl example).
+    Historical FUELHH pull using settlementDateFrom/To.
     start_date inclusive, end_date exclusive. Both 'YYYY-MM-DD'.
-
-    Returns long df:
-      startTime (UTC tz-aware), settlementDate, settlementPeriod, fuelType, generation
     """
     url = f"{BMRS_DATASET_BASE}/FUELHH"
-
     d0 = dt.date.fromisoformat(start_date)
     d1 = dt.date.fromisoformat(end_date)
 
@@ -593,43 +597,70 @@ def fetch_fuelhh_range(start_date: str, end_date: str, sleep_s: float = 0.15) ->
         columns=["startTime", "settlementDate", "settlementPeriod", "fuelType", "generation"]
     )
 
-EF_TCO2_PER_MWH = {
-    "CCGT": 0.37,
-    "COAL": 0.82,
-    "OIL": 0.65,
-}
-
-def mef_proxy_highest_active(fuelhh: pd.DataFrame) -> pd.DataFrame:
+def prepare_fuel_wide(fuelhh: pd.DataFrame) -> pd.DataFrame:
+    """Pivot fuelhh data into a wide format for CCGT, COAL, and OIL."""
     wide = (
-        fuelhh.pivot_table(index="startTime", columns="fuelType", values="generation", aggfunc="sum")
-              .fillna(0.0)
+        fuelhh.pivot_table(
+            index="startTime",
+            columns="fuelType",
+            values="generation",
+            aggfunc="sum"
+        )
+        .fillna(0.0)
+        .sort_index()
     )
+    # Ensure all required fossil fuel columns exist
+    for col in ["CCGT", "COAL", "OIL"]:
+        if col not in wide.columns:
+            wide[col] = 0.0
+    return wide[["CCGT", "COAL", "OIL"]]
 
-    active = {ft: (wide.get(ft, 0.0) > 0) for ft in EF_TCO2_PER_MWH.keys()}
-    fuels_by_ef = sorted(EF_TCO2_PER_MWH.items(), key=lambda x: x[1], reverse=True)
+def mef_ramp_based(
+    wide: pd.DataFrame,
+    min_ramp_mw: float = 100.0,
+    ccgt_floor_mw: float = 2000.0,
+) -> pd.Series:
+    """
+    Heuristic to determine the Marginal Emissions Factor (MEF) based on ramping.
+    It prioritizes carbon-heavy fuels that are increasing generation.
+    """
+    dwide = wide.diff().fillna(0.0)
 
-    mef = pd.Series(0.0, index=wide.index)
-    for ft, ef in fuels_by_ef:
-        mef = mef.where(~active[ft], ef)
+    # Identify which fossil fuels are actively ramping up
+    ramping_coal = dwide["COAL"] > min_ramp_mw
+    ramping_oil  = dwide["OIL"]  > min_ramp_mw
+    ramping_ccgt = dwide["CCGT"] > min_ramp_mw
+    ccgt_floor   = wide["CCGT"]  > ccgt_floor_mw
 
-    return mef.rename("mef_tco2_per_mwh").reset_index()
-
-def to_g_per_kwh(df_mef: pd.DataFrame) -> pd.DataFrame:
-    df = df_mef.copy()
-    df["mef_gco2_kwh"] = df["mef_tco2_per_mwh"] * 1000.0  # 1 t/MWh = 1000 g/kWh
-    return df[["startTime", "mef_gco2_kwh"]]
+    # Use np.select to assign the EF based on the most carbon-intensive ramping fuel
+    vals = np.select(
+        [ramping_coal, ramping_oil, ramping_ccgt, ccgt_floor],
+        [
+            EF_TCO2_PER_MWH["COAL"],
+            EF_TCO2_PER_MWH["OIL"],
+            EF_TCO2_PER_MWH["CCGT"],
+            EF_TCO2_PER_MWH["CCGT"],
+        ],
+        default=0.0,
+    )
+    return pd.Series(vals, index=wide.index, name="mef_tco2_per_mwh")
 
 def compute_mef_model_a(start_date: str, end_date: str, tz_naive: bool = True) -> pd.DataFrame:
+    """Main wrapper to compute the ramp-based MEF and convert to gCO2/kWh."""
     fuelhh = fetch_fuelhh_range(start_date, end_date)
     if fuelhh.empty:
         return pd.DataFrame(columns=["timestamp", "mef_gco2_kwh"])
 
-    mef = mef_proxy_highest_active(fuelhh)
-    mef = to_g_per_kwh(mef)
+    # Apply new ramping heuristic
+    wide = prepare_fuel_wide(fuelhh)
+    mef_series = mef_ramp_based(wide)
 
-    out = mef.rename(columns={"startTime": "timestamp"}).copy()
+    # Convert tCO2/MWh to gCO2/kWh (multiplication by 1000)
+    out = mef_series.to_frame().reset_index()
+    out = out.rename(columns={"startTime": "timestamp", "mef_tco2_per_mwh": "mef_gco2_kwh"})
+    out["mef_gco2_kwh"] = out["mef_gco2_kwh"] * 1000.0
+
     out["timestamp"] = pd.to_datetime(out["timestamp"], utc=True, errors="coerce")
-
     if tz_naive:
         out["timestamp"] = out["timestamp"].dt.tz_convert(None)
 
