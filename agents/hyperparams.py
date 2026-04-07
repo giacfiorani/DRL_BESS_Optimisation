@@ -14,15 +14,15 @@
 #NEED TO RUN HPO 
 
 DQN_HYPERPARAMS = {
-    "gamma":        0.9781,
+    "gamma":        0.9696,
     "epsilon":      1.0,
-    "lr":           1.028e-05,
-    "batch_size":   512,
-    "eps_dec":      1.375e-06,  # INTERIM: eps_min at ep 500 (was 2.487e-05 from kappa=35 HPO)
+    "lr":           1.62e-05,
+    "batch_size":   256,
+    "eps_dec":      5.88e-06,
     "eps_min":      0.01,
     "lambda_ci":    0.1,
     "n_episodes":   1000,
-    "target_update_frequency": 7500,
+    "target_update_frequency": 7000
 }
 
 DDQN_HYPERPARAMS = {
@@ -39,15 +39,15 @@ DDQN_HYPERPARAMS = {
 
 # NEED TO RUN HPO
 D3QN_HYPERPARAMS = {
-    "gamma":        0.9741490704098825,
+    "gamma":        0.9867,
     "epsilon":      1.0,
-    "lr":           1.944371379845093e-05,
+    "lr":           1.03e-05,
     "batch_size":   128,
-    "eps_dec":      1.375e-06,  # INTERIM: eps_min at ep 500 (was 2.94e-05 from kappa=35 HPO)
+    "eps_dec":      9.95e-06,
     "eps_min":      0.01,
     "lambda_ci":    0.1,
     "n_episodes":   1000,
-    "target_update_frequency": 7500,
+    "target_update_frequency": 13000
 }
 
 # NEED TO RUN HPO
@@ -77,6 +77,25 @@ SAC_HYPERPARAMS = {
     "gamma":        0.9988,
     "tau":          0.005,
     "reward_scale": 7,
+    "batch_size":   128,
+    "warmup_steps": 5000,
+    "n_episodes":   1000,
+    "lambda_ci":    0.1,
+}
+
+SAC_UVFA_HYPERPARAMS = {
+    # Best trial: #14  val_reward=50.70  (30-trial TPE search, 2026-03-30)
+    # Key HPO findings:
+    #   - High gamma (>0.993) essential: BESS rewards accumulate over days
+    #   - reward_scale=6-9: keeps entropy alive, prevents alpha collapse
+    #   - alpha_lr < 2e-4: slower entropy tuning avoids premature convergence
+    #   - lr ~1.5e-4: slower than default 3e-4, more stable critic updates
+    #   - batch_size=128: outperforms 256 consistently across top-5 trials
+    "lr":           1.457e-04,
+    "alpha_lr":     7e-5,
+    "gamma":        0.9988,
+    "tau":          0.005,
+    "reward_scale": 4,
     "batch_size":   128,
     "warmup_steps": 5000,
     "n_episodes":   1000,

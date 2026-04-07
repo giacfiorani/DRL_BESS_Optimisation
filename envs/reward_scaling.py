@@ -105,6 +105,25 @@ def compute_scales(
         "S_ci": S_ci,
     }
 
+def get_frozen_scales() -> dict:
+    """
+    Return hardcoded reward/observation scaling constants computed ONCE from
+    the post-crisis window (2023-01-01 onward, first 70% of that range).
+
+    These values were computed with:
+        compute_scales(train_ratio=0.70, train_start="2023-01-01")
+
+    Frozen so that train, val, and test environments all use identical
+    normalisation regardless of which data slice they load.
+    """
+    return {
+        "S_profit":     7487.199743,
+        "S_carbon_gbp": 754.750447,
+        "S_price":      145.000000,
+        "S_ci":         247.000000,
+    }
+
+
 # ====
 # DEFAULT MODULE-LEVEL CONSTANTS (backward compatible)
 # Computed from full training set (2022-inclusive, first 70%)

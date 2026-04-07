@@ -13,6 +13,7 @@ import envs.env_config
 from agents.sac_agent import SACAgent
 from envs.battery_env import BatteryEnv
 from agents.hyperparams import SAC_HYPERPARAMS
+from envs.reward_scaling import get_frozen_scales
 
 # ============================================================
 # REPRODUCIBILITY SEEDS
@@ -39,24 +40,11 @@ DEFAULT_VAL_INTERVAL = 50      # evaluate on val every N episodes
 DEFAULT_PATIENCE     = 200     # episodes without val improvement → early stop
 
 
-def evaluate_on_val(agent, hp, train_start=None):
+def evaluate_on_val(agent, val_env):
     """Run a single deterministic rollout over the entire validation split.
     Returns (cumulative_reward, metrics_dict).
     No transitions are stored — zero buffer contamination."""
-    val_env = BatteryEnv(
-        config=env_config,
-        lambda_ci=hp["lambda_ci"],
-        split="val",
-        episode_days=999,            # overridden below
-        randomize_init_soc=False,
-        randomize_start=False,
-        continuous_action=True,
-        seed=42,
-        train_start=train_start,
-    )
-    # Set episode length to exactly the val period so we never cross into test
-    val_env.episode_days = len(val_env.active_valid_days)
-
+    
     agent.actor.eval()
 
     obs, _ = val_env.reset()
@@ -85,7 +73,6 @@ def evaluate_on_val(agent, hp, train_start=None):
     }
     return cumulative_reward, metrics
 
-
 def train(agent_name: str, run_id: int, seed: int = 42,
           train_start: str = None, warmup_steps: int = DEFAULT_WARMUP_STEPS,
           val_interval: int = DEFAULT_VAL_INTERVAL,
@@ -112,8 +99,8 @@ def train(agent_name: str, run_id: int, seed: int = 42,
     os.makedirs(f"models/{run_name}", exist_ok=True)
 
     writer = SummaryWriter(f"runs/{run_name}")
+    frozen_scales = get_frozen_scales()
 
-    # Build continuous environment
     env = BatteryEnv(
         config=env_config,
         lambda_ci=hp["lambda_ci"],
@@ -122,8 +109,22 @@ def train(agent_name: str, run_id: int, seed: int = 42,
         randomize_start=True,
         continuous_action=True,
         seed=seed,
-        train_start=train_start,
+        precomputed_scales=frozen_scales,
     )
+
+    # Build continuous environment (Validation) ONCE
+    val_env = BatteryEnv(
+        config=env_config,
+        lambda_ci=hp["lambda_ci"],
+        split="val",
+        episode_days=999,
+        randomize_init_soc=False,
+        randomize_start=False,
+        continuous_action=True,
+        seed=42,
+        precomputed_scales=frozen_scales,
+    )
+    val_env.episode_days = len(val_env.active_valid_days)
 
     # Build SAC agent
     agent = SACAgent(
@@ -270,7 +271,7 @@ def train(agent_name: str, run_id: int, seed: int = 42,
             print(f"  -> Checkpoint saved: {ckpt_path}")
 
             # --- Validation evaluation ---
-            val_reward, val_metrics = evaluate_on_val(agent, hp, train_start)
+            val_reward, val_metrics = evaluate_on_val(agent, val_env)
 
             writer.add_scalar("Val/Cumulative_Reward", val_reward, i)
             writer.add_scalar("Val/Profit_GBP", val_metrics["val_profit_gbp"], i)

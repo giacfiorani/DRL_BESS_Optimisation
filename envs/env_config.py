@@ -36,7 +36,7 @@ N_cabinets = 268
 N_cells = N_cells_per_cabinet  # Total series depth per branch (unchanged)
 Q_cell_C = Q_cell * N_cabinets * 3600  # C (Coulombs) — scaled pack charge: 280 Ah × 268 × 3600 s/h
 E_nominal = E_nominal_per_cabinet * N_cabinets  # kWh (scaled nominal energy: 372.7 × 268)
-E_max = E_nominal / 1000.0  # MWh (converted: 99.9 kWh = ~0.0999 MWh)
+E_max = E_nominal / 1000.0  # MWh (99,883.6 kWh → 99.9 MWh)
 
 
 # ========

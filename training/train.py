@@ -17,6 +17,7 @@ from agents.d3qn_per_agent import D3QNPERAgent
 from envs.battery_env import BatteryEnv
 from utils.action_encoding import decode, N_ACTIONS
 from agents.hyperparams import DQN_HYPERPARAMS, DDQN_HYPERPARAMS, D3QN_HYPERPARAMS, D3QN_PER_HYPERPARAMS
+from envs.reward_scaling import get_frozen_scales
 
 # ============================================================
 # REPRODUCIBILITY SEEDS — 5-seed averaging for academic robustness
@@ -59,22 +60,11 @@ DEFAULT_VAL_INTERVAL = 50      # evaluate on val every N episodes
 DEFAULT_PATIENCE     = 200     # episodes without val improvement → early stop
 
 
-def evaluate_on_val(agent, hp, train_start=None):
+def evaluate_on_val(agent, val_env):
     """Run a single deterministic (epsilon=0) rollout over the entire validation split.
     Returns (cumulative_reward, metrics_dict).
-    No transitions are stored — zero buffer contamination."""
-    val_env = BatteryEnv(
-        config=env_config,
-        lambda_ci=hp["lambda_ci"],
-        split="val",
-        episode_days=999,            # overridden below
-        randomize_init_soc=False,
-        randomize_start=False,
-        seed=42,
-        train_start=train_start,
-    )
-    # Set episode length to exactly the val period so we never cross into test
-    val_env.episode_days = len(val_env.active_valid_days)
+    No transitions are stored — zero buffer contamination.
+    val_env must be pre-created (created once in train() to avoid repeated parquet reads)."""
 
     # Save and override epsilon for greedy evaluation
     original_epsilon = agent.epsilon
@@ -151,7 +141,8 @@ def train(agent_name: str, run_id: int, seed: int = 42, resume_path: str = None,
     os.makedirs(f"models/{run_name}", exist_ok=True)
 
     writer = SummaryWriter(f"runs/{run_name}")
-    # 3. Pass train_start into BatteryEnv
+    frozen_scales = get_frozen_scales()
+
     env = BatteryEnv(
         config=env_config,
         lambda_ci=hp["lambda_ci"],
@@ -159,9 +150,22 @@ def train(agent_name: str, run_id: int, seed: int = 42, resume_path: str = None,
         randomize_init_soc=True,
         randomize_start=True,
         seed=seed,
-        train_start=train_start,
+        precomputed_scales=frozen_scales,
     )
     agent = build_agent(agent_name, hp)
+
+    # Create val_env once — avoids re-reading parquet from disk every val_interval episodes.
+    val_env = BatteryEnv(
+        config=env_config,
+        lambda_ci=hp["lambda_ci"],
+        split="val",
+        episode_days=999,
+        randomize_init_soc=False,
+        randomize_start=False,
+        seed=42,
+        precomputed_scales=frozen_scales,
+    )
+    val_env.episode_days = len(val_env.active_valid_days)
 
     start_episode = 0
     if resume_path and os.path.exists(resume_path):
@@ -360,7 +364,7 @@ def train(agent_name: str, run_id: int, seed: int = 42, resume_path: str = None,
             print(f"  -> Checkpoint saved: {ckpt_path}")
 
             # --- Validation evaluation ---
-            val_reward, val_metrics = evaluate_on_val(agent, hp, train_start)
+            val_reward, val_metrics = evaluate_on_val(agent, val_env)
 
             writer.add_scalar("Val/Cumulative_Reward", val_reward, i)
             writer.add_scalar("Val/Profit_GBP", val_metrics["val_profit_gbp"], i)
@@ -388,10 +392,13 @@ def train(agent_name: str, run_id: int, seed: int = 42, resume_path: str = None,
                 }, best_path)
                 print(f"  -> New best val model saved (reward={val_reward:.2f})")
             else:
-                patience_counter += val_interval
+                # Only count patience after exploration is done — val rollouts
+                # are meaningless while epsilon is still high (agent acts randomly).
+                if agent.epsilon <= agent.eps_min * 1.5:
+                    patience_counter += val_interval
 
-            # --- Optional early stopping ---
-            if patience_counter >= patience:
+            # --- Early stopping (only after exploration phase) ---
+            if patience_counter >= patience and agent.epsilon <= agent.eps_min * 1.5:
                 print(f"  [EARLY STOP] No val improvement for {patience} episodes. "
                       f"Best at episode {best_val_episode}.")
                 break

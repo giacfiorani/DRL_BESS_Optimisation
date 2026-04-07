@@ -64,6 +64,9 @@ def fetch_48sp_curve(
             end_date=end_date,
             fields=[field],
         )
+        if ts is None or ts.empty:
+            print(f"WARNING: Empty ts for RIC {ric} (SP{sp}), skipping")
+            continue
 
         ts = ts.sort_index() #ensures dataframe dates are stored ascending
 

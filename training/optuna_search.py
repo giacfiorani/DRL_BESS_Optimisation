@@ -22,6 +22,7 @@ from agents.d3qn import D3QNAgent
 from agents.d3qn_per_agent import D3QNPERAgent
 from agents.sac_agent import SACAgent
 from envs.battery_env import BatteryEnv
+from envs.reward_scaling import get_frozen_scales
 from utils.action_encoding import N_ACTIONS
 from utils.action_encoding import decode
 
@@ -67,14 +68,15 @@ def objective(trial: optuna.Trial, agent_name: str) -> float:
         T.mps.manual_seed(SEED)
 
     # ── 3. Build environment ──
+    frozen_scales = get_frozen_scales()
     env = BatteryEnv(
         config             = env_config,
         lambda_ci          = LAMBDA_CI,
         split              = "train",
-        randomize_init_soc = True,   
-        randomize_start    = True,   
-        seed               = SEED,   
-        train_start        = "2023-01-01"
+        randomize_init_soc = True,
+        randomize_start    = True,
+        seed               = SEED,
+        precomputed_scales = frozen_scales,
     )
 
     # ── 4. Build agent ──
@@ -132,7 +134,7 @@ def objective(trial: optuna.Trial, agent_name: str) -> float:
         randomize_init_soc = False,
         randomize_start    = False,
         seed               = SEED,
-        train_start        = "2023-01-01",
+        precomputed_scales = frozen_scales,
     )
     val_env.episode_days = len(val_env.active_valid_days)
 
@@ -169,6 +171,7 @@ def sac_objective(trial: optuna.Trial) -> float:
         T.mps.manual_seed(SEED)
 
     # ── 3. Build continuous environment ──
+    frozen_scales = get_frozen_scales()
     env = BatteryEnv(
         config             = env_config,
         lambda_ci          = LAMBDA_CI,
@@ -177,7 +180,7 @@ def sac_objective(trial: optuna.Trial) -> float:
         randomize_start    = True,
         continuous_action  = True,
         seed               = SEED,
-        train_start        = "2023-01-01",
+        precomputed_scales = frozen_scales,
     )
 
     # ── 4. Build SAC agent ──
@@ -233,7 +236,7 @@ def sac_objective(trial: optuna.Trial) -> float:
         randomize_start    = False,
         continuous_action  = True,
         seed               = SEED,
-        train_start        = "2023-01-01",
+        precomputed_scales = frozen_scales,
     )
     val_env.episode_days = len(val_env.active_valid_days)
 

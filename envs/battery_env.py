@@ -48,6 +48,7 @@ class BatteryEnv(Env):
         val_ratio: float = 0.15,
         train_start: str | None = None,
         continuous_action: bool = False, 
+        precomputed_scales: dict | None = None,
     ):
         super().__init__()
 
@@ -105,9 +106,11 @@ class BatteryEnv(Env):
         # ========
         # 2. DYNAMIC REWARD SCALING & DATA LOADING
         # ========
-        
-        # This function now respects train_start (e.g., excluding 2022 price spikes)
-        scales = compute_scales(train_ratio=train_ratio, train_start=self.train_start)
+        if precomputed_scales is not None:
+            scales = precomputed_scales
+        else:
+            # Fallback for old scripts or debugging
+            scales = compute_scales(train_ratio=train_ratio, train_start=self.train_start)
         
         self.profit_scale = float(scales["S_profit"])
         self.carbon_scale = float(scales["S_carbon_gbp"])
@@ -128,13 +131,6 @@ class BatteryEnv(Env):
 
         df["delivery_ts"] = pd.to_datetime(df["delivery_ts"])
         df["delivery_date"] = pd.to_datetime(df["delivery_date"]).dt.floor("D")
-
-        # --- DATA WINDOWING ---
-        # If train_start is set (e.g. '2023-07-01'), discard all data before that date.
-        # This ensures the splits (70/15/15) only apply to the representative window.
-        if self.train_start is not None:
-            start_dt = pd.Timestamp(self.train_start)
-            df = df[df["delivery_ts"] >= start_dt].copy()
 
         df = df.sort_values("delivery_ts").reset_index(drop=True)
 
@@ -215,6 +211,20 @@ class BatteryEnv(Env):
             high=np.concatenate([high_main, high_da, high_ci]),
             dtype=np.float32,
         )
+
+        # ========
+        # DIAGNOSTIC — verify split boundaries (remove before final training runs)
+        # ========
+        _target = np.datetime64("2025-05-26", "D")
+        _in_test = bool(
+            len(self.valid_days_test) > 0
+            and self.valid_days_test[0] <= _target <= self.valid_days_test[-1]
+        )
+        print(f"[SPLIT DIAGNOSTIC] Total valid days: {n}")
+        print(f"  Train: {self.valid_days_train[0]} → {self.valid_days_train[-1]} ({len(self.valid_days_train)} days)")
+        print(f"  Val:   {self.valid_days_val[0]}   → {self.valid_days_val[-1]}   ({len(self.valid_days_val)} days)")
+        print(f"  Test:  {self.valid_days_test[0]}  → {self.valid_days_test[-1]}  ({len(self.valid_days_test)} days)")
+        print(f"  2025-05-26 in test split: {_in_test}")
 
         # OCV Lookup
         self.ocv_soc_points, self.ocv_cell_volts = config.ocv_lookup_table()
@@ -568,9 +578,8 @@ class BatteryEnv(Env):
         E_import_kWh = max(-E_act_MWh, 0.0) * 1000.0
         E_export_kWh = max(E_act_MWh, 0.0) * 1000.0
 
-        # Symmetric AEF: both import and export use actual grid carbon intensity.
-        # mef_gco2_kwh was found to be a CCGT flatline (370 g/kWh for 99.96% of rows)
-        # with zero temporal variance, making the asymmetric formulation indefensible.
+        # CI for imports 
+        # MEF for exports
         net_tCO2 = (E_import_kWh * ci_now - E_export_kWh * mef_now) / 1e6
         carbon_cashflow_gbp = carbon_price_now * net_tCO2
 

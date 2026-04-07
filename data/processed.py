@@ -16,11 +16,11 @@ from eikon_rics_lists import DA_HH_RICS
 # -----------------------
 # Config
 # -----------------------
-START = "2022-01-01"
-END   = "2026-01-01"
+START = "2025-05-26"
+END   = "2026-03-31"
 
 ROOT = Path(__file__).resolve().parents[1]
-OUT_PATH = ROOT / "data" / "data.parquet"
+OUT_PATH = ROOT / "data" / "evaluate_data.parquet"
 
 # -----------------------
 # Helpers
@@ -275,6 +275,11 @@ cols = [
 
 merged = merged[cols].sort_values(["delivery_ts"]).reset_index(drop=True)
 merged = merged.drop_duplicates(subset=["delivery_date", "tau"], keep="first").reset_index(drop=True)
+
+# Ensure carbon intensity columns are float64, not str (NESO CKAN API returns values as JSON strings)
+for _ci_col in ["ci_actual_gco2_kwh", "ci_forecast_gco2_kwh"]:
+    if _ci_col in merged.columns:
+        merged[_ci_col] = pd.to_numeric(merged[_ci_col], errors="coerce").astype("float64")
 
 # sanity: tau in 1..48
 bad_tau = (~merged["tau"].between(1, 48)).mean()

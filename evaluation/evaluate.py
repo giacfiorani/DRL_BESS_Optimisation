@@ -28,8 +28,10 @@ import seaborn as sns
 from matplotlib.gridspec import GridSpec
 
 # --- Project imports ---
+from benchmarks.lp_benchmark import solve_lp_benchmark
 from envs.battery_env import BatteryEnv
 import envs.env_config as env_config
+from envs.reward_scaling import get_frozen_scales
 from agents.dqn_agent import DQNAgent
 from agents.ddqn_agent import DDQNAgent
 from agents.d3qn import D3QNAgent
@@ -86,6 +88,9 @@ FIGURES_DIR: str = "results/figures"
 CHECKPOINT_DIR: str = "models"
 INPUT_DIMS: int = 103
 SEED = 42
+# System capacity: 268 CATL EnerOne cabinets × 0.3727 MWh = 99.9 MWh.
+# Must match env_config.E_max exactly. Used as the EFC denominator throughout.
+E_MAX_MWH: float = 99.9
 
 AGENTS: dict[str, type] = {
     "dqn":      DQNAgent,
@@ -226,7 +231,7 @@ def build_test_env(lambda_ci: float = 0.9, continuous_action: bool = False) -> B
         randomize_start=False,
         continuous_action=continuous_action,
         seed=SEED,
-        train_start="2023-01-01"
+        precomputed_scales=get_frozen_scales(),
     )
     return env
 
@@ -344,7 +349,14 @@ def add_derived_columns(df: pd.DataFrame) -> pd.DataFrame:
     df["date"] = pd.to_datetime(df["delivery_ts"]).dt.date
     df["month"] = pd.to_datetime(df["delivery_ts"]).dt.month_name()
     df["day_of_week"] = pd.to_datetime(df["delivery_ts"]).dt.day_name()
-    # Use actual_reward from env (already has lambda_ci applied) instead of reconstructing
+    # financial_profit_gbp: pure market-realised profit, no lambda_ci weighting.
+    # = R_DA + R_ID - deg_cost.  Use this for paper tables comparing agents fairly
+    # across different lambda_ci values (the weighted objective is not comparable).
+    df["financial_profit_gbp"] = (
+        df["Planned_Profit"] + df["Intraday_Profit"] - df["degradation_cost_gbp"]
+    )
+    # rev_net_gbp: lambda-weighted objective (= actual_reward = R_total_gbp).
+    # Matches the training signal; used for cumulative-profit plots and Sharpe.
     df["rev_net_gbp"] = df["actual_reward"]
     df["E_throughput_MWh"] = df["P_applied_MW"].abs() * 0.5
 
@@ -357,14 +369,40 @@ def add_derived_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def compute_kpis(df: pd.DataFrame) -> dict[str, float]:
-    """Compute all KPIs from a step-level DataFrame."""
+    """Compute all KPIs from a step-level DataFrame.
 
-    daily_profit = df.groupby('date')['rev_net_gbp'].sum()
-    total_net_profit = df["rev_net_gbp"].sum()
-    mean_daily_profit = daily_profit.mean()
+    Sharpe ratio is intentionally omitted. There is no principled capital
+    denominator for a physical BESS asset: CAPEX (£31M) produces a near-zero
+    or negative result; stored-energy value (£1M) produces ~14, which is a
+    dimensionless P&L Information Ratio (Lo et al., PLoS ONE 2009), not a
+    portfolio Sharpe and not comparable to published benchmarks. No surveyed
+    BESS RL paper (IEEE TSG, Applied Energy, Energies 2020-2025) reports a
+    Sharpe ratio. Domain-standard KPIs are used instead: £/MW/year (Modo
+    Energy GB BESS Index), win rate, and max drawdown.
+    """
+    # Use financial_profit_gbp (R_DA + R_ID - deg, no lambda_ci weighting)
+    # for all economic KPIs so they are comparable across lambda_ci values.
+    if "financial_profit_gbp" in df.columns:
+        daily_profit = df.groupby('date')['financial_profit_gbp'].sum()
+        financial_profit = df["financial_profit_gbp"].sum()
+    else:
+        daily_profit = df.groupby('date')['rev_net_gbp'].sum()
+        financial_profit = None
+
+    total_net_profit = df["rev_net_gbp"].sum()   # lambda-weighted RL objective
+
     profit_volatility = daily_profit.std()
+    mean_daily_profit = daily_profit.mean()
 
-    sharpe_ratio = mean_daily_profit / profit_volatility if profit_volatility != 0 else 0
+    # Win rate: fraction of test days with positive financial P&L
+    win_rate = (daily_profit > 0).mean() * 100
+
+    # £/MW/year: GB industry standard (Modo Energy BESS Index).
+    # Annualise from the actual test-period length then normalise by power capacity.
+    P_MAX_MW = 49.9  # system power capacity (0.5C × 99.9 MWh)
+    n_days = len(daily_profit)
+    annualised_profit = financial_profit * (365.0 / n_days) if financial_profit is not None else None
+    rev_per_mw_year = annualised_profit / P_MAX_MW if annualised_profit is not None else None
 
     cum_profit = daily_profit.cumsum()
     drawdown = cum_profit.cummax() - cum_profit
@@ -379,8 +417,10 @@ def compute_kpis(df: pd.DataFrame) -> dict[str, float]:
     deg_cost_pct = (df["degradation_cost_gbp"].sum() / gross_revenue) * 100
     carbon_cost_pct = (df["carbon_cashflow"].sum() / gross_revenue) * 100 if "carbon_cashflow" in df.columns else 0
 
-    efc = df["E_throughput_MWh"].sum() / (2 * 100)
-    revenue_per_efc = total_net_profit / efc if efc != 0 else 0
+    # EFC = total energy throughput (one-way MWh) / (2 × system capacity MWh).
+    # Denominator = 2 × 99.9 MWh = 199.8 MWh  (charge + discharge per full cycle).
+    efc = df["E_throughput_MWh"].sum() / (2 * E_MAX_MWH)
+    revenue_per_efc = financial_profit / efc if (efc != 0 and financial_profit is not None) else 0
     soc_mean, soc_std = df["soc"].mean(), df["soc"].std()
 
     idle_fraction = (df["P_applied_MW"].abs() < 1e-4).mean() * 100
@@ -401,32 +441,83 @@ def compute_kpis(df: pd.DataFrame) -> dict[str, float]:
     carbon_penalty_gbp = df["carbon_cashflow"].sum()
 
     return {
-        "Total Profit (£)": total_net_profit,
-        "Mean Daily Profit": mean_daily_profit,
-        "Profit Volatility": profit_volatility,
-        "Sharpe Ratio": sharpe_ratio,
-        "Max Drawdown (£)": max_drawdown,
-        "DA Rev %": da_revenue_pct,
-        "ID Rev %": id_revenue_pct,
-        "Deg Cost %": deg_cost_pct,
-        "Carbon Cost %": carbon_cost_pct,
-        "EFC": efc,
-        "Rev/EFC": revenue_per_efc,
-        "SoC Mean": soc_mean,
-        "SoC Std": soc_std,
-        "Idle Fraction %": idle_fraction,
-        "Charge/Discharge Ratio": charge_discharge_ratio,
-        "Clipping Rate %": clipping_rate,
-        "Net Carbon (tCO2)": net_carbon_tco2,
+        "Financial Profit (£)":     financial_profit,    # R_DA + R_ID - deg, no λ weighting
+        "Total Profit (£)":         total_net_profit,     # lambda-weighted RL objective
+        "Annualised Profit (£)":    annualised_profit,
+        "£/MW/year":                rev_per_mw_year,      # annualised financial profit / P_max_MW
+        "Mean Daily Profit":        mean_daily_profit,
+        "Profit Volatility":        profit_volatility,
+        "Win Rate %":               win_rate,
+        "Max Drawdown (£)":         max_drawdown,
+        "DA Rev %":                 da_revenue_pct,
+        "ID Rev %":                 id_revenue_pct,
+        "Deg Cost %":               deg_cost_pct,
+        "Carbon Cost %":            carbon_cost_pct,
+        "EFC":                      efc,
+        "Rev/EFC":                  revenue_per_efc,
+        "SoC Mean":                 soc_mean,
+        "SoC Std":                  soc_std,
+        "Idle Fraction %":          idle_fraction,
+        "Charge/Discharge Ratio":   charge_discharge_ratio,
+        "Clipping Rate %":          clipping_rate,
+        "Net Carbon (tCO2)":        net_carbon_tco2,
         "Carbon Intensity (tCO2/MWh)": carbon_intensity,
-        "Carbon Penalty (£)": carbon_penalty_gbp,
-        "Market Timing Score %": market_timing_score,
-        "DA Plan Utilisation %": da_plan_utilisation,
+        "Carbon Penalty (£)":       carbon_penalty_gbp,
+        "Market Timing Score %":    market_timing_score,
+        "DA Plan Utilisation %":    da_plan_utilisation,
     }
 
 
-def build_comparison_table(all_results: dict[str, pd.DataFrame]) -> pd.DataFrame:
-    """Build the master comparison table."""
+def run_lp_benchmarks(lambda_values: list[float]) -> dict[float, dict]:
+    """Solve the perfect-foresight LP once per lambda_ci on the test split.
+
+    Uses the full 2022+ dataset with a 70/15/15 chronological split, identical
+    to the training scripts. The test rows align with 2025-05-26 → 2026-01-01.
+
+    Returns a dict keyed by lambda_ci value, each entry being the full result
+    dict from solve_lp_benchmark (keys: lp_status, objective_gbp, revenue_gbp,
+    deg_cost_gbp, carbon_cost_gbp, schedule).
+    """
+    ROOT = Path(__file__).resolve().parents[1]
+    data_path = ROOT / "data" / "data.parquet"
+
+    df_full = pd.read_parquet(data_path).copy()
+    df_full["delivery_ts"] = pd.to_datetime(df_full["delivery_ts"])
+
+    n_total = df_full["delivery_ts"].dt.date.nunique()
+    n_train = int(n_total * 0.70)
+    n_val   = int(n_total * 0.15)
+
+    all_dates  = sorted(df_full["delivery_ts"].dt.date.unique())
+    test_dates = set(all_dates[n_train + n_val:])
+    df_test = df_full[
+        df_full["delivery_ts"].dt.date.apply(lambda d: d in test_dates)
+    ].copy()
+
+    print(f"  [LP] Test split: {len(test_dates)} days, {len(df_test)} half-hours "
+          f"({all_dates[n_train + n_val]} → {all_dates[-1]})")
+
+    lp_results: dict[float, dict] = {}
+    for lam in lambda_values:
+        print(f"  [LP] Solving λ_ci = {lam:.1f} …", end=" ", flush=True)
+        result = solve_lp_benchmark(df_test, lambda_ci=lam)
+        print(result["lp_status"])
+        lp_results[lam] = result
+
+    return lp_results
+
+
+def build_comparison_table(all_results: dict[str, pd.DataFrame],
+                           lp_objectives: dict[float, dict] | None = None,
+                           baseline_lambda: float | None = None) -> pd.DataFrame:
+    """Build the master comparison table.
+
+    If lp_objectives is provided (dict keyed by lambda_ci → solve_lp_benchmark result),
+    a 'LP Efficiency Ratio (%)' column is appended to every agent/baseline row and
+    one 'lp_lambda{x}' row is added per lambda_ci value at the bottom of the table.
+    """
+    import re
+
     kpi_rows = []
 
     for label, df in all_results.items():
@@ -434,8 +525,60 @@ def build_comparison_table(all_results: dict[str, pd.DataFrame]) -> pd.DataFrame
             df = add_derived_columns(df)
 
         kpi_dict = compute_kpis(df)
-        final_row = {"strategy": label, **kpi_dict}
-        kpi_rows.append(final_row)
+
+        # LP Efficiency Ratio: agent_profit / lp_objective × 100
+        if lp_objectives:
+            m = re.search(r"lambda([\d.]+)", label)
+            lam = float(m.group(1)) if m else baseline_lambda
+            lp_res = lp_objectives.get(lam) if lam is not None else None
+            if lp_res and lp_res.get("objective_gbp"):
+                lp_obj = lp_res["objective_gbp"]
+                ratio = (kpi_dict["Total Profit (£)"] / lp_obj * 100) if lp_obj != 0 else None
+            else:
+                ratio = None
+            kpi_dict["LP Efficiency Ratio (%)"] = ratio
+
+        kpi_rows.append({"strategy": label, **kpi_dict})
+
+    # Append one LP oracle row per lambda_ci so it appears in the table
+    if lp_objectives:
+        for lam, lp_res in sorted(lp_objectives.items()):
+            if lp_res.get("lp_status") != "Optimal":
+                continue
+            P_MAX_MW = 49.9
+            lp_obj = lp_res["objective_gbp"]
+            lp_annualised = lp_obj * (365.0 / 219)
+            lp_row = {
+                "strategy": f"lp_lambda{lam:.1f}",
+                "Financial Profit (£)": lp_obj,
+                "Total Profit (£)": lp_obj,
+                "Annualised Profit (£)": lp_annualised,
+                "£/MW/year": lp_annualised / P_MAX_MW,
+                "Mean Daily Profit": lp_obj / 219,
+                "Profit Volatility": None,
+                "Win Rate %": None,
+                "Max Drawdown (£)": None,
+                "DA Rev %": None,
+                "ID Rev %": None,
+                "Deg Cost %": (lp_res["deg_cost_gbp"] / lp_res["revenue_gbp"] * 100)
+                               if lp_res.get("revenue_gbp") else None,
+                "Carbon Cost %": (lp_res["carbon_cost_gbp"] / lp_res["revenue_gbp"] * 100)
+                                  if lp_res.get("revenue_gbp") else None,
+                "EFC": None,
+                "Rev/EFC": None,
+                "SoC Mean": None,
+                "SoC Std": None,
+                "Idle Fraction %": None,
+                "Charge/Discharge Ratio": None,
+                "Clipping Rate %": None,
+                "Net Carbon (tCO2)": None,
+                "Carbon Intensity (tCO2/MWh)": None,
+                "Carbon Penalty (£)": lp_res["carbon_cost_gbp"],
+                "Market Timing Score %": None,
+                "DA Plan Utilisation %": None,
+                "LP Efficiency Ratio (%)": 100.0,
+            }
+            kpi_rows.append(lp_row)
 
     summary_df = pd.DataFrame(kpi_rows)
     save_path = f"{RESULTS_DIR}/evaluation_summary.csv"
@@ -730,8 +873,8 @@ def plot_agent_vs_baselines_bar(all_results: dict[str, pd.DataFrame],
         df = all_results[baseline_name]
 
         net_profit = df["actual_reward"].sum()
-        
-        efc = df["P_applied_MW"].abs().sum() * 0.5 / 100
+
+        efc = df["P_applied_MW"].abs().sum() * 0.5 / E_MAX_MWH
         net_carbon = df["net_carbon_tCO2"].sum()
 
         baseline_metrics[baseline_name] = {
@@ -756,9 +899,10 @@ def plot_agent_vs_baselines_bar(all_results: dict[str, pd.DataFrame],
 
             df_seed = all_results[key]
 
-            # Calculate for THIS SEED ONLY
-            net_profit = df["actual_reward"].sum()
-            efc = df_seed["P_applied_MW"].abs().sum() * 0.5 / 100
+            # Calculate for THIS SEED ONLY — must use df_seed, not the outer `df`
+            # which holds the last baseline's dataframe (was a silent data-corruption bug).
+            net_profit = df_seed["actual_reward"].sum()
+            efc = df_seed["P_applied_MW"].abs().sum() * 0.5 / E_MAX_MWH
             net_carbon = df_seed["net_carbon_tCO2"].sum()
 
             seed_profits.append(net_profit)
@@ -885,14 +1029,11 @@ def plot_cumulative_profit_timeseries(all_results: dict[str, pd.DataFrame],
 
             df_seed = all_results[key]
             df_seed["date"] = pd.to_datetime(df_seed["delivery_ts"]).dt.date
-            daily_profit = df_seed.groupby("date").apply(
-                lambda d: (
-                    d["Planned_Profit"].sum() +
-                    d["Intraday_Profit"].sum() -
-                    d["degradation_cost_gbp"].sum() -
-                    d["carbon_cashflow"].sum()
-                )
-            )
+            # Use actual_reward (= R_DA + R_ID - deg - lambda_ci * carbon_cashflow).
+            # This matches compute_kpis() and the comparison table.  The previous
+            # formula subtracted the full carbon_cashflow (effectively lambda_ci=1),
+            # making this plot inconsistent with the reported "Total Profit" numbers.
+            daily_profit = df_seed.groupby("date")["actual_reward"].sum()
             daily_profit_seeds.append(daily_profit)
 
         if not daily_profit_seeds:
@@ -945,34 +1086,39 @@ def plot_rolling_risk_drawdown(all_results: dict[str, pd.DataFrame],
 
             df_seed = all_results[key]
             df_seed["date"] = pd.to_datetime(df_seed["delivery_ts"]).dt.date
-            daily_profit = df.groupby("date")["actual_reward"].sum()
+            daily_profit = df_seed.groupby("date")["actual_reward"].sum()  # was `df` — wrong scope
             daily_profit_seeds.append(daily_profit)
 
         if not daily_profit_seeds:
             continue
 
-        # Average the daily profit Series across seeds FIRST
-        mean_daily_profit = pd.concat(daily_profit_seeds, axis=1).mean(axis=1)
+        # Compute cumulative profit and rolling Sharpe PER SEED, then average the
+        # resulting series.  Computing Sharpe on a seed-mean time series compresses
+        # variance artificially and systematically overestimates the Sharpe ratio.
+        cum_profit_seeds = []
+        sharpe_seeds = []
+        for dp in daily_profit_seeds:
+            cp = dp.cumsum()
+            cum_profit_seeds.append(cp)
+            rm = dp.rolling(window=30).mean()
+            rs = dp.rolling(window=30).std()
+            sharpe_seeds.append(np.sqrt(365) * (rm / rs.replace(0, np.nan)))
 
-        # NOW compute all risk metrics from the averaged daily profit
-        cum_profit = mean_daily_profit.cumsum()
-        running_max = cum_profit.cummax()
-        drawdown = cum_profit - running_max
+        mean_cum_profit = pd.concat(cum_profit_seeds, axis=1).mean(axis=1)
+        running_max = mean_cum_profit.cummax()
+        drawdown = mean_cum_profit - running_max
 
-        # Plot cumulative profit
         color = COLORS.get(agent_name, "#cccccc")
-        ax_cum.plot(cum_profit.index, cum_profit.values,
+        ax_cum.plot(mean_cum_profit.index, mean_cum_profit.values,
                    label=agent_name.upper(), color=color, linewidth=2.5)
 
-        # Fill drawdown region
-        ax_cum.fill_between(cum_profit.index, cum_profit.values, running_max.values,
+        # Drawdown shading on the mean cumulative trajectory
+        ax_cum.fill_between(mean_cum_profit.index, mean_cum_profit.values, running_max.values,
                            where=(drawdown <= 0), alpha=0.2, color="red")
 
-        # Rolling 14-day Sharpe on the AVERAGED daily profit
-        rolling_mean = mean_daily_profit.rolling(window=14).mean()
-        rolling_std = mean_daily_profit.rolling(window=14).std()
-        sharpe = rolling_mean / rolling_std.replace(0, np.nan)
-        sharpe_data[agent_name] = sharpe
+        # Rolling 14-day Sharpe: average of per-seed Sharpe series
+        mean_sharpe = pd.concat(sharpe_seeds, axis=1).mean(axis=1)
+        sharpe_data[agent_name] = mean_sharpe
     
     ax_cum.set_xlabel("Date", fontsize=11)
     ax_cum.set_ylabel("Cumulative Net Profit (GBP)", fontsize=11, color="black")
@@ -1456,7 +1602,7 @@ def plot_theme_a_financial(all_results: dict, all_kpis: dict, agent_names: list,
         if baseline_name in all_results:
             df = all_results[baseline_name]
             net_profit = df["actual_reward"].sum()
-            efc = df["P_applied_MW"].abs().sum() * 0.5 / 100
+            efc = df["P_applied_MW"].abs().sum() * 0.5 / E_MAX_MWH
             net_carbon = df["net_carbon_tCO2"].sum()
             baseline_metrics[baseline_name] = {
                 "Net Profit (£)": net_profit,
@@ -1474,7 +1620,7 @@ def plot_theme_a_financial(all_results: dict, all_kpis: dict, agent_names: list,
             if key in all_results:
                 df_seed = all_results[key]
                 seed_profits.append(df_seed["actual_reward"].sum())
-                seed_efcs.append(df_seed["P_applied_MW"].abs().sum() * 0.5 / 0.3727)
+                seed_efcs.append(df_seed["P_applied_MW"].abs().sum() * 0.5 / E_MAX_MWH)
                 seed_carbons.append(df_seed["net_carbon_tCO2"].sum())
 
         if seed_profits:
@@ -1566,25 +1712,33 @@ def plot_theme_a_financial(all_results: dict, all_kpis: dict, agent_names: list,
                 daily_profit_seeds.append(df_seed.groupby("date")["actual_reward"].sum())
 
         if daily_profit_seeds:
-            mean_daily = pd.concat(daily_profit_seeds, axis=1).mean(axis=1)
-            cum_profit = mean_daily.cumsum()
-            running_max = cum_profit.cummax()
-            drawdown = cum_profit - running_max
+            # Compute cumulative profit and rolling Sharpe PER SEED, then average.
+            # Computing Sharpe on the seed-mean compresses variance and inflates the ratio.
+            cum_seeds = []
+            sharpe_seeds = []
+            for dp in daily_profit_seeds:
+                cp = dp.cumsum()
+                cum_seeds.append(cp)
+                rm = dp.rolling(window=130).mean()
+                rs = dp.rolling(window=30).std()
+                sharpe_seeds.append(np.sqrt(365) * (rm / rs.replace(0, np.nan)))
+
+            mean_cum = pd.concat(cum_seeds, axis=1).mean(axis=1)
+            running_max = mean_cum.cummax()
+            drawdown = mean_cum - running_max
 
             color = COLORS.get(agent_name, "#cccccc")
 
             # Plot cumulative profit and drawdown on left axis
-            ax4.plot(cum_profit.index, cum_profit.values, label=agent_name.upper(),
+            ax4.plot(mean_cum.index, mean_cum.values, label=agent_name.upper(),
                     color=color, linewidth=2.5, zorder=10)
-            ax4.fill_between(cum_profit.index, cum_profit.values, running_max.values,
+            ax4.fill_between(mean_cum.index, mean_cum.values, running_max.values,
                            where=(drawdown <= 0), alpha=0.15, color="red", zorder=5)
 
-            # Calculate and plot rolling 14-day Sharpe ratio on right axis
-            rolling_mean = mean_daily.rolling(window=14).mean()
-            rolling_std = mean_daily.rolling(window=14).std()
-            sharpe_ratio = rolling_mean / rolling_std.replace(0, np.nan)
+            # Rolling 14-day Sharpe: average of per-seed Sharpe series
+            mean_sharpe = pd.concat(sharpe_seeds, axis=1).mean(axis=1)
 
-            ax4_sharpe.plot(sharpe_ratio.index, sharpe_ratio.values,
+            ax4_sharpe.plot(mean_sharpe.index, mean_sharpe.values,
                            linestyle='--', linewidth=1.5, color=color, alpha=0.6,
                            label=f'{agent_name.upper()} (Sharpe)', zorder=8)
             sharpe_plotted.append(True)
@@ -1592,7 +1746,7 @@ def plot_theme_a_financial(all_results: dict, all_kpis: dict, agent_names: list,
     ax4.set_xlabel("Date", fontsize=10, fontweight='bold')
     ax4.set_ylabel("Cumulative Profit (£)", fontsize=10, fontweight='bold', color='black')
     ax4.tick_params(axis='y', labelcolor='black')
-    ax4_sharpe.set_ylabel("Rolling 14-Day Sharpe Ratio", fontsize=10, fontweight='bold', color='#1f77b4')
+    ax4_sharpe.set_ylabel("Rolling 30-Day Annualised Sharpe Ratio", fontsize=10, fontweight='bold', color='#1f77b4')
     ax4_sharpe.tick_params(axis='y', labelcolor='#1f77b4')
     ax4.set_title("(d) Rolling Risk & Drawdown", fontsize=11, fontweight='bold')
 
@@ -1923,8 +2077,10 @@ def plot_theme_c_policy(all_results: dict, agent_names: list,
             p_max = df["P_applied_MW"].abs().max()
             df_power_binned = pd.cut(df["P_applied_MW"], bins=11, labels=range(11))
 
-            # Use tau (settlement period) as DA slot proxy
-            df_tau_binned = df["tau"] % 48
+            # tau in the CSV is 1-indexed (1..48 from the env info dict).
+            # Convert to 0-indexed (0..47) before binning; without the -1,
+            # slot 48 maps to 0 and the last period merges into the first bucket.
+            df_tau_binned = (df["tau"] - 1) % 48
 
             # Count action frequencies
             for power_bin, tau_slot in zip(df_power_binned, df_tau_binned):
@@ -2107,12 +2263,30 @@ if __name__ == "__main__":
                        help="Lambda_ci values for Pareto ablation")
     parser.add_argument("--baselines", action="store_true", default=False,
                        help="Also run Idle, Random, and P20/P80 baselines")
+    parser.add_argument("--run-lp", action="store_true", default=False,
+                       help="Solve the perfect-foresight LP benchmark for each lambda_ci "
+                            "and add LP Efficiency Ratio (%) to the comparison table")
     parser.add_argument("--generate-figures", action="store_true", default=False,
                        help="Generate publication-grade visualizations")
     args = parser.parse_args()
 
     all_results = {}
-    all_kpis = {}
+    all_kpis    = {}
+    lp_objectives: dict | None = None
+
+    if args.run_lp:
+        print("\n" + "="*50)
+        print(" RUNNING LP BENCHMARK (perfect foresight)")
+        print("="*50)
+        lp_objectives = run_lp_benchmarks(
+            lambda_values=args.lambda_values,
+        )
+        for lam, res in lp_objectives.items():
+            if res["lp_status"] == "Optimal":
+                print(f"  λ={lam:.1f}  LP Objective: £{res['objective_gbp']:,.0f}  "
+                      f"Revenue: £{res['revenue_gbp']:,.0f}  "
+                      f"DegCost: £{res['deg_cost_gbp']:,.0f}  "
+                      f"CarbonCost: £{res['carbon_cost_gbp']:,.0f}")
 
     if args.baselines:
         print("\n" + "="*50)
@@ -2173,7 +2347,12 @@ if __name__ == "__main__":
     print(" EVALUATION COMPLETE")
     print("="*50)
 
-    summary_table = build_comparison_table(all_results)
+    baseline_lambda = args.lambda_values[0] if args.lambda_values else 0.1
+    summary_table = build_comparison_table(
+        all_results,
+        lp_objectives=lp_objectives,
+        baseline_lambda=baseline_lambda,
+    )
     print(summary_table.to_string())
 
     # Generate publication figures

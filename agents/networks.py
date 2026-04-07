@@ -132,6 +132,42 @@ class SACCriticNetwork(nn.Module):
         file_name = os.path.join(model_folder_path, file_name)
         T.save(self.state_dict(), file_name)
 
+class SAC2CriticNetwork(nn.Module):
+    def __init__(self, lr, input_dims=103, n_actions=3, fc1_dims=512, fc2_dims=512):
+        super(SACCriticNetwork, self).__init__()
+
+        # Neural Network Layers (State + Action concatenated)
+        self.fc1 = nn.Linear(input_dims + n_actions, fc1_dims)
+        self.ln1 = nn.LayerNorm(fc1_dims)
+        self.fc2 = nn.Linear(fc1_dims, fc2_dims)
+        self.ln2 = nn.LayerNorm(fc2_dims)
+        self.q = nn.Linear(fc2_dims, 1)
+
+        self.optimiser = optim.Adam(self.parameters(), lr=lr)
+
+        if T.backends.mps.is_available():
+            self.device = T.device('mps')
+        elif T.cuda.is_available():
+            self.device = T.device('cuda:0')
+        else:
+            self.device = T.device('cpu')
+
+        self.to(self.device)
+
+    def forward(self, state, action):
+        q_value = T.cat([state, action], dim=1)
+        q_value = F.relu(self.ln1(self.fc1(q_value)))
+        q_value = F.relu(self.ln2(self.fc2(q_value)))
+        q_value = self.q(q_value)
+        return q_value
+
+    def save(self, file_name='sac_critic.pth'):
+        model_folder_path = './models' 
+        if not os.path.exists(model_folder_path):
+            os.makedirs(model_folder_path)
+        file_name = os.path.join(model_folder_path, file_name)
+        T.save(self.state_dict(), file_name)
+
 class SACActorNetwork(nn.Module):
     def __init__(self, lr, input_dims=103, n_actions=3, fc1_dims=512, fc2_dims=512):
         super(SACActorNetwork, self).__init__()
