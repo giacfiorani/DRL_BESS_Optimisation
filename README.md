@@ -126,16 +126,16 @@ tensorboard --logdir runs/
 
 Test-set performance over the 219-day held-out period (2025-05-26 – 2026-01-01), five seeds. LP efficiency is agent profit expressed as a percentage of the perfect-foresight LP oracle ceiling (£793.0k).
 
-| Agent | Net Profit (£k) | LP Efficiency (%) | Net Carbon (tCO₂)¹ |
+| Agent | Net Profit (£k) | LP Efficiency (%) | Net Carbon (tCO₂) |
 |---|---|---|---|
-| **SAC (3D)** | **337.3 ± 48.4** | **42.5** | **−4,898** |
-| D3QN | 250.9 ± 24.6 | 31.6 | — |
-| DDQN | 118.1 ± 50.9 | 14.9 | — |
-| DQN | 8.6 ± 27.5 | 1.1 | — |
-| P20/P80 heuristic | −101.1 | −12.7 | — |
+| **SAC (3D)** | **337.3 ± 48.4** | **42.5** | **−4,898 ± 701** |
+| D3QN | 250.9 ± 24.6 | 31.6 | −3,761 ± 394 |
+| DDQN | 118.1 ± 50.9 | 14.9 | −3,618 ± 658 |
+| DQN | 8.6 ± 27.5 | 1.1 | −469 ± 575 |
+| P20/P80 heuristic | −101.1 | −12.7 | −6,437 |
 | LP oracle | 793.0 | 100.0 | — |
 
-¹ Net carbon displacement (negative = emissions avoided) reported for SAC at λ_ci = 0.1 only; per-agent figures for discrete baselines were not recorded in the primary evaluation.
+All RL results at λ_ci = 0.1; net carbon is negative = emissions displaced. LP oracle carbon is not reported (deterministic programme evaluated without stochastic rollout). P20/P80 carbon displacement is high relative to its negative profit because the percentile rule frequently charges during low-price, high-carbon periods.
 
 Key findings:
 - SAC outperforms D3QN by 1.34× (£337k vs £251k) despite operating in a fundamentally different action space; the gap conflates action-space design, algorithm family, and power granularity.
@@ -151,7 +151,7 @@ Key findings:
                  Day-Ahead and Intraday Battery Storage Dispatch via Deep
                  Reinforcement Learning},
   school      = {University College London},
-  year        = {2025},
+  year        = {2026},
   type        = {MEng Dissertation},
   department  = {Mechanical Engineering},
 }

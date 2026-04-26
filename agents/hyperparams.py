@@ -51,3 +51,31 @@ SAC_HYPERPARAMS = {
     "n_episodes":   1000,
     "lambda_ci":    0.1,
 }
+
+# ====
+# Other Hyperparameters for two other agents not used
+# ====
+
+# SAC_UVFA_HYPERPARAMS = {
+#     "lr":           1.457e-04,
+#     "alpha_lr":     7e-5,
+#     "gamma":        0.9988,
+#     "tau":          0.005,
+#     "reward_scale": 4,
+#     "batch_size":   128,
+#     "warmup_steps": 5000,
+#     "n_episodes":   1000,
+#     "lambda_ci":    0.1,
+# }
+
+# D3QN_PER_HYPERPARAMS = {
+#     "gamma":        0.975,      # PLACEHOLDER — will update from trial results
+#     "epsilon":      1.0,
+#     "lr":           1.45e-05,   # PLACEHOLDER
+#     "batch_size":   256,        # PLACEHOLDER
+#     "eps_dec":      1.375e-06,  # INTERIM: eps_min at ep 500 (was 1.32e-04 placeholder)
+#     "eps_min":      0.01,
+#     "lambda_ci":    0.1,
+#     "n_episodes":   1000,
+#     "target_update_frequency": 5500,  # PLACEHOLDER
+# }
