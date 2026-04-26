@@ -81,6 +81,7 @@ prompt_toolkit==3.0.52
 protobuf==4.25.8
 psutil==7.1.3
 ptyprocess==0.7.0
+PuLP==3.3.0
 pure_eval==0.2.3
 pyarrow==22.0.0
 pygame==2.6.1
@@ -94,8 +95,10 @@ Quandl==3.7.0
 requests==2.32.5
 rfc3986==1.5.0
 rich==14.3.2
+ruff==0.15.9
 scikit-learn==1.8.0
 scipy==1.17.0
+seaborn==0.13.2
 six==1.17.0
 soupsieve==2.8.3
 SQLAlchemy==2.0.48

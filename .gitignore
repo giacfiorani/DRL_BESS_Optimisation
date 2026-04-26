@@ -10,6 +10,7 @@ __pycache__/
 
 # Virtual env
 .venv/
+bess_venv
 # Data & results (keep raw small CSVs if you want, but ignore heavy stuff)
 data/processed/
 results/runs/
@@ -22,6 +23,12 @@ agents/agent_config.py
 .claude/
 # Sensitive API configs
 data/eikon.cfg
+
+markdowns/
+docs/
+.ruff_cache
+training_logs/
+_archive/
 
 #Not useful
 data/visualise_data.ipynb

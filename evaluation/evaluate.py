@@ -85,6 +85,8 @@ N_TEST_DAYS: int = 219
 TEST_START_DATE: str = "2025-05-26"
 RESULTS_DIR: str = "results/test_rollouts"
 FIGURES_DIR: str = "results/figures"
+FIGURES_MAIN_DIR: str = "results/figures_main"
+FIGURES_APPENDIX_DIR: str = "results/figures_appendix"
 CHECKPOINT_DIR: str = "models"
 INPUT_DIMS: int = 103
 SEED = 42
@@ -110,6 +112,8 @@ HYPERPARAMS_MAP: dict[str, dict] = {
 
 os.makedirs(RESULTS_DIR, exist_ok=True)
 os.makedirs(FIGURES_DIR, exist_ok=True)
+os.makedirs(FIGURES_MAIN_DIR, exist_ok=True)
+os.makedirs(FIGURES_APPENDIX_DIR, exist_ok=True)
 
 
 # ============================================================
@@ -161,19 +165,33 @@ def load_frozen_agent(agent_name: str, seed: int,
 
 
 def load_frozen_sac_agent(seed: int,
+                          lambda_ci: float | None = None,
                           checkpoint_dir: str = CHECKPOINT_DIR) -> SACAgent:
-    """Load a trained SAC checkpoint (best_val_model.pth) for greedy evaluation."""
+    """Load a trained SAC checkpoint (best_val_model.pth) for greedy evaluation.
+
+    Parameters
+    ----------
+    seed       : training seed (0-4)
+    lambda_ci  : carbon penalty used during training (e.g. 0.1, 0.3).
+                 When provided, the glob is narrowed to directories whose name
+                 contains ``lci{lambda_ci:.1f}`` so that Pareto-sweep runs
+                 (5 lambdas × 5 seeds = 25 dirs) pick the correct checkpoint.
+                 When None the original seed-only glob is used (backwards
+                 compatible for single-lambda evaluations).
+    """
     hp = SAC_HYPERPARAMS
 
-    # Prefer best_val_model.pth; fall back to final_model.pth
-    search_best = f"{checkpoint_dir}/*_SAC_seed{seed}_*/best_val_model.pth"
-    search_final = f"{checkpoint_dir}/*_SAC_seed{seed}_*/final_model.pth"
+    # Build lambda-aware glob suffix when lambda_ci is supplied
+    lci_fragment = f"*lci{lambda_ci:.1f}*" if lambda_ci is not None else "*"
+
+    search_best  = f"{checkpoint_dir}/*_SAC_seed{seed}_*{lci_fragment}/best_val_model.pth"
+    search_final = f"{checkpoint_dir}/*_SAC_seed{seed}_*{lci_fragment}/final_model.pth"
     matching = glob(search_best) or glob(search_final)
 
     if not matching:
         raise FileNotFoundError(
-            f"No SAC model found for seed {seed}. "
-            f"Patterns tried: {search_best}, {search_final}"
+            f"No SAC model found for seed={seed}, lambda_ci={lambda_ci}. "
+            f"Patterns tried:\n  {search_best}\n  {search_final}"
         )
 
     ckpt_path = matching[0]
@@ -1875,7 +1893,6 @@ def plot_theme_b_operations(all_results: dict, agent_names: list,
         if charges:
             x = np.arange(len(lambda_values))
             width = 0.2
-            offset = (len(agent_names) - 1) * width / 2
             agent_idx = agent_names.index(agent_name)
             x_pos = x + (agent_idx - len(agent_names)/2 + 0.5) * width
 
@@ -1966,7 +1983,7 @@ def plot_theme_b_operations(all_results: dict, agent_names: list,
 
     ax4.set_xlabel("Days into Test Period", fontsize=10, fontweight='bold')
     ax4.set_ylabel("Cumulative Degradation Cost (£)", fontsize=10, fontweight='bold')
-    ax4.set_title(f"(d) Degradation Cost Trade-off", fontsize=11, fontweight='bold')
+    ax4.set_title("(d) Degradation Cost Trade-off", fontsize=11, fontweight='bold')
     ax4.grid(True, alpha=0.3)
     ax4.legend(loc='upper left', fontsize=8, framealpha=0.9)
 
@@ -2020,7 +2037,7 @@ def plot_theme_c_policy(all_results: dict, agent_names: list,
             ax1.plot(x_loess, y_loess, color="red", linewidth=2.5, label="Trend", alpha=0.9)
             ax1.set_xlabel("Intraday Price (£/MWh)", fontsize=10, fontweight='bold')
             ax1.set_ylabel("Dispatched Power (MW)", fontsize=10, fontweight='bold')
-            ax1.set_title(f"(a) Price--Dispatch Sensitivity", fontsize=11, fontweight='bold')
+            ax1.set_title("(a) Price--Dispatch Sensitivity", fontsize=11, fontweight='bold')
             ax1.legend(loc='best', fontsize=8, framealpha=0.9)
             ax1.grid(alpha=0.3)
 
@@ -2048,7 +2065,7 @@ def plot_theme_c_policy(all_results: dict, agent_names: list,
                        cbar_kws={"label": "Mean Power (MW)"}, ax=ax2)
             ax2.set_xlabel("Price Quantile", fontsize=10, fontweight='bold')
             ax2.set_ylabel("SoC", fontsize=10, fontweight='bold')
-            ax2.set_title(f"(b) SoC--Price Policy Surface", fontsize=11, fontweight='bold')
+            ax2.set_title("(b) SoC--Price Policy Surface", fontsize=11, fontweight='bold')
 
     # ─────────────────────────────────────────────────────────────────────────────
     # (1,3) Action Space Utilization (Heatmap) — Figure 13
@@ -2074,7 +2091,6 @@ def plot_theme_c_policy(all_results: dict, agent_names: list,
             action_freq = np.zeros((n_power_levels, n_da_slots))
 
             # Bin dispatch power to 11 levels
-            p_max = df["P_applied_MW"].abs().max()
             df_power_binned = pd.cut(df["P_applied_MW"], bins=11, labels=range(11))
 
             # tau in the CSV is 1-indexed (1..48 from the env info dict).
@@ -2248,6 +2264,804 @@ def plot_theme_d_regime(all_results: dict, all_kpis: dict, agent_names: list,
 
 
 # ============================================================
+# IEEE PUBLICATION: 5 MAIN FIGURES + 4 APPENDIX FIGURES
+# Hypothesis: Continuous 3D SAC outperforms discrete DDQN
+# ============================================================
+
+def save_kpi_table(all_results: dict, all_kpis: dict,
+                   lp_objectives: dict | None,
+                   agent_names: list,
+                   target_lambda: float = 0.9) -> None:
+    """Save Table_1_KPI_Summary.csv — all mean ± std columns for Table 3 in the thesis.
+
+    Columns exported:
+        Strategy, Formulation,
+        Profit_mean_GBP, Profit_std_GBP,
+        WinRate_mean_pct, WinRate_std_pct,
+        EFC_mean, EFC_std,
+        Rev_EFC_mean_GBP, Rev_EFC_std_GBP,
+        NetCarbon_mean_tCO2, NetCarbon_std_tCO2,
+        DegCost_mean_GBP, DegCost_std_GBP,
+        CarbonCost_mean_GBP, CarbonCost_std_GBP,
+        LP_Oracle_GBP,          ← reference ceiling for the target lambda
+        LP_Oracle_DegCost_GBP,  ← LP oracle degradation cost
+        LP_Oracle_CarbonCost_GBP, ← LP oracle carbon cost
+        LP_Efficiency_Ratio_pct
+    """
+    # Resolve LP oracle values once for the target lambda
+    lp_obj_gbp: float | None = None
+    lp_deg_gbp: float | None = None
+    lp_carbon_gbp: float | None = None
+    lp_efc: float | None = None
+    lp_rev_efc: float | None = None
+    lp_net_carbon_tco2: float | None = None
+    if lp_objectives and target_lambda in lp_objectives:
+        _lp = lp_objectives[target_lambda]
+        if _lp.get("lp_status") == "Optimal":
+            lp_obj_gbp    = _lp.get("objective_gbp")
+            lp_deg_gbp    = _lp.get("deg_cost_gbp")
+            lp_carbon_gbp = _lp.get("carbon_cost_gbp")
+            # Derive EFC, Rev/EFC, Net Carbon from LP schedule
+            _sched = _lp.get("schedule")
+            if _sched is not None:
+                _dt = 0.5  # half-hour settlement periods
+                _throughput = (_sched["P_ch_MW"] + _sched["P_dis_MW"]).sum() * _dt
+                lp_efc = _throughput / (2 * E_MAX_MWH)
+                lp_rev_efc = (lp_obj_gbp / lp_efc) if lp_efc > 0 else None
+                # Net carbon: import absorbs CI, export displaces MEF (tCO2)
+                _e_imp_kwh = _sched["P_ch_MW"]  * _dt * 1000  # MWh → kWh
+                _e_exp_kwh = _sched["P_dis_MW"] * _dt * 1000
+                _net_co2_kg = (_e_imp_kwh * _sched["ci_gco2_kwh"]
+                               - _e_exp_kwh * _sched["mef_gco2_kwh"]).sum()
+                lp_net_carbon_tco2 = _net_co2_kg / 1e6  # gCO2 → tCO2
+            else:
+                lp_efc = lp_rev_efc = lp_net_carbon_tco2 = None
+
+    FORMULATION = {
+        "sac":  "Continuous 3D",
+        "ddqn": "Discrete 5,808",
+        "dqn":  "Discrete 5,808",
+        "d3qn": "Discrete 5,808",
+    }
+
+    rows = []
+
+    # ── RL agents (multi-seed) ──────────────────────────────────────────
+    for agent_name in agent_names:
+        profits, efcs, rev_efcs, win_rates, net_carbons = [], [], [], [], []
+        deg_costs, carbon_costs = [], []
+        idle_fracs, da_rev_pcts, id_rev_pcts, deg_cost_pcts, da_plan_utils = [], [], [], [], []
+        for seed in range(5):
+            key = f"{agent_name}_lambda{target_lambda:.1f}_seed{seed}"
+            if key not in all_kpis:
+                continue
+            k = all_kpis[key]
+            profits.append(k["Financial Profit (£)"])
+            efcs.append(k["EFC"])
+            rev_efcs.append(k["Rev/EFC"])
+            win_rates.append(k["Win Rate %"])
+            net_carbons.append(k["Net Carbon (tCO2)"])
+            idle_fracs.append(k["Idle Fraction %"])
+            da_rev_pcts.append(k["DA Rev %"])
+            id_rev_pcts.append(k["ID Rev %"])
+            deg_cost_pcts.append(k["Deg Cost %"])
+            da_plan_utils.append(k["DA Plan Utilisation %"])
+            # Absolute cost values from the step-level dataframe
+            df_seed = all_results.get(key)
+            if df_seed is not None:
+                deg_costs.append(df_seed["degradation_cost_gbp"].sum())
+                carbon_costs.append(df_seed["carbon_cashflow"].sum())
+
+        if not profits:
+            continue
+
+        lp_eff = (np.mean(profits) / lp_obj_gbp * 100) if lp_obj_gbp else None
+        rows.append({
+            "Strategy":               agent_name.upper(),
+            "Formulation":            FORMULATION.get(agent_name.lower(), "—"),
+            "Profit_mean_GBP":        round(np.mean(profits), 0),
+            "Profit_std_GBP":         round(np.std(profits, ddof=1), 0),
+            "WinRate_mean_pct":       round(np.mean(win_rates), 1),
+            "WinRate_std_pct":        round(np.std(win_rates, ddof=1), 1),
+            "EFC_mean":               round(np.mean(efcs), 2),
+            "EFC_std":                round(np.std(efcs, ddof=1), 2),
+            "Rev_EFC_mean_GBP":       round(np.mean(rev_efcs), 0),
+            "Rev_EFC_std_GBP":        round(np.std(rev_efcs, ddof=1), 0),
+            "NetCarbon_mean_tCO2":    round(np.mean(net_carbons), 1),
+            "NetCarbon_std_tCO2":     round(np.std(net_carbons, ddof=1), 1),
+            "DegCost_mean_GBP":       round(np.mean(deg_costs), 0) if deg_costs else None,
+            "DegCost_std_GBP":        round(np.std(deg_costs, ddof=1), 0) if len(deg_costs) > 1 else 0,
+            "CarbonCost_mean_GBP":    round(np.mean(carbon_costs), 0) if carbon_costs else None,
+            "CarbonCost_std_GBP":     round(np.std(carbon_costs, ddof=1), 0) if len(carbon_costs) > 1 else 0,
+            "LP_Oracle_GBP":          round(lp_obj_gbp, 0) if lp_obj_gbp else None,
+            "LP_Oracle_DegCost_GBP":  round(lp_deg_gbp, 0) if lp_deg_gbp else None,
+            "LP_Oracle_CarbonCost_GBP": round(lp_carbon_gbp, 0) if lp_carbon_gbp else None,
+            "LP_Efficiency_Ratio_pct": round(lp_eff, 1) if lp_eff is not None else None,
+            # ── Extended operational metrics (pivoted table) ──────────
+            "IdleFrac_mean_pct":      round(np.mean(idle_fracs), 1) if idle_fracs else None,
+            "IdleFrac_std_pct":       round(np.std(idle_fracs, ddof=1), 1) if len(idle_fracs) > 1 else 0,
+            "DARevPct_mean":          round(np.mean(da_rev_pcts), 1) if da_rev_pcts else None,
+            "DARevPct_std":           round(np.std(da_rev_pcts, ddof=1), 1) if len(da_rev_pcts) > 1 else 0,
+            "IDRevPct_mean":          round(np.mean(id_rev_pcts), 1) if id_rev_pcts else None,
+            "IDRevPct_std":           round(np.std(id_rev_pcts, ddof=1), 1) if len(id_rev_pcts) > 1 else 0,
+            "DegCostPct_mean":        round(np.mean(deg_cost_pcts), 1) if deg_cost_pcts else None,
+            "DegCostPct_std":         round(np.std(deg_cost_pcts, ddof=1), 1) if len(deg_cost_pcts) > 1 else 0,
+            "DAPlanUtil_mean_pct":    round(np.mean(da_plan_utils), 1) if da_plan_utils else None,
+            "DAPlanUtil_std_pct":     round(np.std(da_plan_utils, ddof=1), 1) if len(da_plan_utils) > 1 else 0,
+        })
+
+    # ── Deterministic baselines (single rollout — std = 0) ─────────────
+    BASELINE_FORMULATION = {
+        "p20p80": "Rule-based",
+        "idle":   "Null",
+        "random": "Null",
+    }
+    for label in ["p20p80", "idle", "random"]:
+        if label not in all_results:
+            continue
+        df_bl = all_results[label]
+        if "financial_profit_gbp" not in df_bl.columns:
+            df_bl = add_derived_columns(df_bl.copy())
+        k = compute_kpis(df_bl)
+        lp_eff = (k["Financial Profit (£)"] / lp_obj_gbp * 100) if lp_obj_gbp else None
+        bl_deg_cost    = df_bl["degradation_cost_gbp"].sum() if "degradation_cost_gbp" in df_bl.columns else None
+        bl_carbon_cost = df_bl["carbon_cashflow"].sum() if "carbon_cashflow" in df_bl.columns else None
+        rows.append({
+            "Strategy":               label.upper(),
+            "Formulation":            BASELINE_FORMULATION[label],
+            "Profit_mean_GBP":        round(k["Financial Profit (£)"], 0),
+            "Profit_std_GBP":         0,
+            "WinRate_mean_pct":       round(k["Win Rate %"], 1),
+            "WinRate_std_pct":        0,
+            "EFC_mean":               round(k["EFC"], 2),
+            "EFC_std":                0,
+            "Rev_EFC_mean_GBP":       round(k["Rev/EFC"], 0),
+            "Rev_EFC_std_GBP":        0,
+            "NetCarbon_mean_tCO2":    round(k["Net Carbon (tCO2)"], 1),
+            "NetCarbon_std_tCO2":     0,
+            "DegCost_mean_GBP":       round(bl_deg_cost, 0) if bl_deg_cost is not None else None,
+            "DegCost_std_GBP":        0,
+            "CarbonCost_mean_GBP":    round(bl_carbon_cost, 0) if bl_carbon_cost is not None else None,
+            "CarbonCost_std_GBP":     0,
+            "LP_Oracle_GBP":          round(lp_obj_gbp, 0) if lp_obj_gbp else None,
+            "LP_Oracle_DegCost_GBP":  round(lp_deg_gbp, 0) if lp_deg_gbp else None,
+            "LP_Oracle_CarbonCost_GBP": round(lp_carbon_gbp, 0) if lp_carbon_gbp else None,
+            "LP_Efficiency_Ratio_pct": round(lp_eff, 1) if lp_eff is not None else None,
+            # ── Extended operational metrics ──────────────────────────
+            "IdleFrac_mean_pct":      round(k["Idle Fraction %"], 1),
+            "IdleFrac_std_pct":       0,
+            "DARevPct_mean":          round(k["DA Rev %"], 1),
+            "DARevPct_std":           0,
+            "IDRevPct_mean":          round(k["ID Rev %"], 1),
+            "IDRevPct_std":           0,
+            "DegCostPct_mean":        round(k["Deg Cost %"], 1),
+            "DegCostPct_std":         0,
+            "DAPlanUtil_mean_pct":    round(k["DA Plan Utilisation %"], 1),
+            "DAPlanUtil_std_pct":     0,
+        })
+
+    # ── LP Oracle row ───────────────────────────────────────────────────
+    if lp_obj_gbp is not None:
+        # Derive LP Deg Cost % from schedule if available
+        _lp_data = (lp_objectives or {}).get(target_lambda, {})
+        _lp_sched = _lp_data.get("schedule")
+        lp_idle_frac = None
+        lp_deg_cost_pct = None
+        if _lp_sched is not None and lp_deg_gbp is not None:
+            _total_steps = len(_lp_sched)
+            _active = ((_lp_sched["P_ch_MW"] + _lp_sched["P_dis_MW"]) > 1e-4).sum()
+            lp_idle_frac = round((1.0 - _active / _total_steps) * 100, 1) if _total_steps > 0 else None
+            _lp_rev = _lp_data.get("revenue_gbp")
+            if _lp_rev and _lp_rev > 0:
+                lp_deg_cost_pct = round(lp_deg_gbp / _lp_rev * 100, 1)
+
+        rows.append({
+            "Strategy":               "LP_ORACLE",
+            "Formulation":            "Perfect foresight",
+            "Profit_mean_GBP":        round(lp_obj_gbp, 0),
+            "Profit_std_GBP":         None,
+            "WinRate_mean_pct":       None,
+            "WinRate_std_pct":        None,
+            "EFC_mean":               round(lp_efc, 2) if lp_efc is not None else None,
+            "EFC_std":                None,
+            "Rev_EFC_mean_GBP":       round(lp_rev_efc, 0) if lp_rev_efc is not None else None,
+            "Rev_EFC_std_GBP":        None,
+            "NetCarbon_mean_tCO2":    round(lp_net_carbon_tco2, 1) if lp_net_carbon_tco2 is not None else None,
+            "NetCarbon_std_tCO2":     None,
+            "DegCost_mean_GBP":       round(lp_deg_gbp, 0) if lp_deg_gbp is not None else None,
+            "DegCost_std_GBP":        None,
+            "CarbonCost_mean_GBP":    round(lp_carbon_gbp, 0) if lp_carbon_gbp is not None else None,
+            "CarbonCost_std_GBP":     None,
+            "LP_Oracle_GBP":          round(lp_obj_gbp, 0),
+            "LP_Oracle_DegCost_GBP":  round(lp_deg_gbp, 0) if lp_deg_gbp is not None else None,
+            "LP_Oracle_CarbonCost_GBP": round(lp_carbon_gbp, 0) if lp_carbon_gbp is not None else None,
+            "LP_Efficiency_Ratio_pct": 100.0,
+            # ── Extended operational metrics ──────────────────────────
+            "IdleFrac_mean_pct":      lp_idle_frac,
+            "IdleFrac_std_pct":       None,
+            "DARevPct_mean":          None,
+            "DARevPct_std":           None,
+            "IDRevPct_mean":          None,
+            "IDRevPct_std":           None,
+            "DegCostPct_mean":        lp_deg_cost_pct,
+            "DegCostPct_std":         None,
+            "DAPlanUtil_mean_pct":    None,
+            "DAPlanUtil_std_pct":     None,
+        })
+
+    out_path = os.path.join(FIGURES_MAIN_DIR, "Table_1_KPI_Summary.csv")
+    pd.DataFrame(rows).to_csv(out_path, index=False)
+    print(f"✓ Table_1_KPI_Summary.csv saved → {out_path}")
+    # ── Human-readable summary: Financial block ──────────────────────
+    print("\n  ── KPI Summary: Financial Block ──")
+    print(f"  {'Strategy':<14} {'Profit(£k)':<13} {'Win%':<10} {'EFC':<8} "
+          f"{'Rev/EFC':<9} {'DegCost(£k)':<13} {'LP Eff%':<9}")
+    print("  " + "-" * 80)
+    for r in rows:
+        prof  = f"{r['Profit_mean_GBP']/1000:.1f}±{(r['Profit_std_GBP'] or 0)/1000:.1f}"
+        win   = f"{r['WinRate_mean_pct']}±{r['WinRate_std_pct']}" if r['WinRate_mean_pct'] is not None else "—"
+        efc   = f"{r['EFC_mean']}±{r['EFC_std']}" if r['EFC_mean'] is not None else "—"
+        refc  = f"{r['Rev_EFC_mean_GBP']}±{r['Rev_EFC_std_GBP']}" if r['Rev_EFC_mean_GBP'] is not None else "—"
+        deg   = f"{(r['DegCost_mean_GBP'] or 0)/1000:.1f}" if r.get('DegCost_mean_GBP') is not None else "—"
+        lpeff = f"{r['LP_Efficiency_Ratio_pct']}" if r['LP_Efficiency_Ratio_pct'] is not None else "—"
+        print(f"  {r['Strategy']:<14} {prof:<13} {win:<10} {efc:<8} {refc:<9} {deg:<13} {lpeff:<9}")
+    # ── Human-readable summary: Operational block ────────────────────
+    print("\n  ── KPI Summary: Operational Block (Pivoted) ──")
+    print(f"  {'Strategy':<14} {'Idle%':<10} {'DA Rev%':<10} {'ID Rev%':<10} "
+          f"{'DegCost%':<11} {'DAPlanUtil%':<13}")
+    print("  " + "-" * 70)
+    for r in rows:
+        idle  = f"{r.get('IdleFrac_mean_pct', '—')}±{r.get('IdleFrac_std_pct', 0)}" if r.get('IdleFrac_mean_pct') is not None else "—"
+        da    = f"{r.get('DARevPct_mean', '—')}±{r.get('DARevPct_std', 0)}" if r.get('DARevPct_mean') is not None else "—"
+        iid   = f"{r.get('IDRevPct_mean', '—')}±{r.get('IDRevPct_std', 0)}" if r.get('IDRevPct_mean') is not None else "—"
+        degp  = f"{r.get('DegCostPct_mean', '—')}±{r.get('DegCostPct_std', 0)}" if r.get('DegCostPct_mean') is not None else "—"
+        dapu  = f"{r.get('DAPlanUtil_mean_pct', '—')}±{r.get('DAPlanUtil_std_pct', 0)}" if r.get('DAPlanUtil_mean_pct') is not None else "—"
+        print(f"  {r['Strategy']:<14} {idle:<10} {da:<10} {iid:<10} {degp:<11} {dapu:<13}")
+
+
+def plot_fig1_cumulative_profit(all_results: dict,
+                                agent_names: list,
+                                lp_objectives: dict | None,
+                                target_lambda: float = 0.9) -> None:
+    """
+    Fig1_Cumulative_Profit.pdf
+    Cumulative net profit over 219 days.
+    - ±1 std shading across 5 seeds for each RL agent
+    - LP Oracle ceiling (perfect-foresight upper bound)
+    - P20/P80 and Idle baselines for context
+
+    Sized to exactly one LaTeX column (A4, 1.75 cm L/R margins, default columnsep):
+        columnwidth = (210 - 2×17.5 - 3.5) mm / 2 = 85.75 mm = 3.375 in
+    Using \includegraphics[width=\columnwidth]{...} in LaTeX applies no scaling,
+    so all font sizes here are the true rendered sizes.
+    """
+    # --- Column-exact dimensions ---
+    COL_WIDTH_IN = 3.375   # 85.75 mm — matches LaTeX \columnwidth exactly
+    COL_HEIGHT_IN = 3.0    # tall enough for all lines + legend without crowding
+
+    fig, ax = plt.subplots(figsize=(COL_WIDTH_IN, COL_HEIGHT_IN))
+
+    # Font sizes tuned for COL_WIDTH_IN rendering (no LaTeX rescaling)
+    LABEL_FS  = 7.5
+    TICK_FS   = 6.5
+    LEGEND_FS = 6.0
+    LINE_W    = 1.2   # slightly thinner than default to avoid crowding at small size
+
+    # LP Oracle ceiling
+    if lp_objectives and target_lambda in lp_objectives:
+        lp = lp_objectives[target_lambda]
+        if lp.get("lp_status") == "Optimal":
+            lp_total = lp["objective_gbp"]
+            lp_daily = lp_total / N_TEST_DAYS
+            lp_cum = np.arange(1, N_TEST_DAYS + 1) * lp_daily
+            ax.plot(range(N_TEST_DAYS), lp_cum, color="#000000",
+                    linestyle=":", linewidth=LINE_W, label="LP Oracle", zorder=3)
+            ax.fill_between(range(N_TEST_DAYS), lp_cum, alpha=0.06, color="#000000")
+
+    # Baselines — use financial_profit_gbp (R_DA + R_ID - deg, no λ weighting)
+    for baseline_name in ["idle", "p20p80"]:
+        if baseline_name not in all_results:
+            continue
+        df = all_results[baseline_name]
+        df["date"] = pd.to_datetime(df["delivery_ts"]).dt.date
+        profit_col = "financial_profit_gbp" if "financial_profit_gbp" in df.columns else "actual_reward"
+        daily = df.groupby("date")[profit_col].sum()
+        cum = daily.cumsum().values
+        n = len(cum)
+        ax.plot(range(n), cum, color=COLORS.get(baseline_name, "#aaaaaa"),
+                linewidth=LINE_W, linestyle="--", alpha=0.8,
+                label=baseline_name.upper())
+
+    # RL agents: mean ± 1σ across 5 seeds
+    for agent_name in agent_names:
+        cum_seeds = []
+        for seed in range(5):
+            key = f"{agent_name}_lambda{target_lambda:.1f}_seed{seed}"
+            if key not in all_results:
+                continue
+            df_s = all_results[key]
+            df_s["date"] = pd.to_datetime(df_s["delivery_ts"]).dt.date
+            profit_col = "financial_profit_gbp" if "financial_profit_gbp" in df_s.columns else "actual_reward"
+            daily = df_s.groupby("date")[profit_col].sum()
+            cum_seeds.append(daily.cumsum().values)
+
+        if not cum_seeds:
+            continue
+
+        arr = np.array(cum_seeds)       # (n_seeds, n_days)
+        mean_cum = arr.mean(axis=0)
+        std_cum  = arr.std(axis=0)
+        n = len(mean_cum)
+        color = COLORS.get(agent_name, "#333333")
+
+        ax.plot(range(n), mean_cum, color=color, linewidth=LINE_W + 0.4,
+                label=agent_name.upper(), zorder=5)
+        ax.fill_between(range(n),
+                        mean_cum - std_cum,
+                        mean_cum + std_cum,
+                        alpha=0.18, color=color, zorder=4)
+
+    ax.axhline(0, color="grey", linewidth=0.6, linestyle="-")
+
+    # Compact k-formatted y-axis tick labels (£0, £100k, £200k …)
+    ax.yaxis.set_major_formatter(
+        plt.FuncFormatter(lambda val, _: f"£{val/1000:.0f}k" if val != 0 else "£0")
+    )
+
+    ax.set_xlabel("Day (May 2025 – Jan 2026)", fontsize=LABEL_FS)
+    ax.set_ylabel("Cumulative profit", fontsize=LABEL_FS)
+    ax.tick_params(axis="both", labelsize=TICK_FS)
+    ax.legend(loc="upper left", fontsize=LEGEND_FS, framealpha=0.9,
+              ncol=2, handlelength=1.4, columnspacing=0.8, borderpad=0.4)
+    ax.grid(alpha=0.2, linewidth=0.4)
+
+    plt.tight_layout(pad=0.4)
+    out = os.path.join(FIGURES_MAIN_DIR, "Fig1_Cumulative_Profit.pdf")
+    plt.savefig(out, dpi=300, bbox_inches="tight", format="pdf")
+    plt.close()
+    print(f"✓ Fig1_Cumulative_Profit.pdf → {FIGURES_MAIN_DIR}/")
+
+
+def plot_fig2_revenue_decomposition(all_results: dict,
+                                    all_kpis: dict,
+                                    lp_objectives: dict | None,
+                                    agent_names: list,
+                                    target_lambda: float = 0.9) -> None:
+    """
+    Fig2_Revenue_Decomposition.pdf
+    Stacked bar chart: DA Rev, ID Rev, −Degradation Cost, −Carbon Cost.
+    Each bar = mean across 5 seeds over the full 219-day test period.
+    LP Oracle bar included. FIX: uses ax.bar() (not stackplot) so that
+    degradation cost renders correctly as a downward band.
+    """
+    labels = []
+    da_means, id_means, deg_means, carbon_means = [], [], [], []
+
+    for agent_name in agent_names:
+        da_s, id_s, deg_s, car_s = [], [], [], []
+        for seed in range(5):
+            key = f"{agent_name}_lambda{target_lambda:.1f}_seed{seed}"
+            if key not in all_results:
+                continue
+            df = all_results[key]
+            da_s.append(df["Planned_Profit"].sum())
+            id_s.append(df["Intraday_Profit"].sum())
+            deg_s.append(df["degradation_cost_gbp"].sum())
+            car_s.append(df["carbon_cashflow"].sum())
+        if da_s:
+            labels.append(agent_name.upper())
+            da_means.append(np.mean(da_s))
+            id_means.append(np.mean(id_s))
+            deg_means.append(np.mean(deg_s))
+            carbon_means.append(np.mean(car_s))
+
+    for bl in ["p20p80", "idle", "random"]:
+        if bl in all_results:
+            df = all_results[bl]
+            if "financial_profit_gbp" not in df.columns:
+                df = add_derived_columns(df.copy())
+            labels.append(bl.upper())
+            da_means.append(df["Planned_Profit"].sum())
+            id_means.append(df["Intraday_Profit"].sum())
+            deg_means.append(df["degradation_cost_gbp"].sum())
+            carbon_means.append(df["carbon_cashflow"].sum())
+
+    if lp_objectives and target_lambda in lp_objectives:
+        lp = lp_objectives[target_lambda]
+        if lp.get("lp_status") == "Optimal":
+            labels.append("LP Oracle")
+            da_means.append(lp.get("revenue_gbp", 0))
+            id_means.append(0.0)
+            deg_means.append(lp.get("deg_cost_gbp", 0))
+            carbon_means.append(lp.get("carbon_cost_gbp", 0))
+
+    if not labels:
+        print("Warning: No data for Fig2 — skipping.")
+        return
+
+    x = np.arange(len(labels))
+    width = 0.55
+
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+
+    # Positive bars: DA revenue (bottom) + ID revenue (stacked on top)
+    da_arr  = np.array(da_means)
+    id_arr  = np.array(id_means)
+    deg_arr = np.array(deg_means)   # positive cost → plot downward
+    car_arr = np.array(carbon_means)
+
+    # Only stack positive ID values upward; negative ID values go downward
+    id_pos = np.maximum(id_arr, 0)
+    id_neg = np.minimum(id_arr, 0)
+
+    ax.bar(x, da_arr, width, label="DA Revenue", color="#2ca02c", alpha=0.85)
+    ax.bar(x, id_pos, width, bottom=da_arr,
+           label="ID Revenue (+)", color="#1f77b4", alpha=0.85)
+    ax.bar(x, id_neg, width, bottom=da_arr,
+           label="ID Revenue (−)", color="#aec7e8", alpha=0.85)
+    # Degradation cost: downward from zero baseline
+    ax.bar(x, -deg_arr, width, label="Degradation Cost", color="#d62728", alpha=0.85)
+    # Carbon cost: stacked downward below degradation
+    ax.bar(x, -car_arr, width, bottom=-deg_arr,
+           label="Carbon Cost", color="#7f7f7f", alpha=0.85)
+
+    ax.axhline(0, color="black", linewidth=0.8)
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=25, ha="right", fontsize=9)
+    ax.set_ylabel("Total revenue / cost over 219 days (£)", fontsize=10)
+    ax.legend(loc="upper right", fontsize=8, framealpha=0.9, ncol=2)
+    ax.grid(axis="y", alpha=0.25)
+    plt.tight_layout()
+    out = os.path.join(FIGURES_MAIN_DIR, "Fig2_Revenue_Decomposition.pdf")
+    plt.savefig(out, dpi=300, bbox_inches="tight", format="pdf")
+    plt.close()
+    print(f"✓ Fig2_Revenue_Decomposition.pdf → {FIGURES_MAIN_DIR}/")
+
+
+def plot_fig3_dispatch_case_study(all_results: dict,
+                                  target_lambda: float = 0.9,
+                                  window_start_day: int = 185) -> None:
+    """
+    Fig3_Dispatch_Case_Study.pdf
+    7-day physical dispatch comparison: SAC (continuous 3D) vs DDQN (discrete 5808).
+    Layout: 2 rows × 2 cols
+      (top-left)  Prices + carbon intensity for SAC window
+      (top-right) Prices + carbon intensity for DDQN window
+      (bot-left)  SoC + dispatched power for SAC
+      (bot-right) SoC + dispatched power for DDQN
+    window_start_day: index into the 219-day test period (default = ~day 185 ≈ November 2025)
+    """
+    window_steps = 7 * 48   # 336 half-hour slots
+
+    agents_to_plot = []
+    for a in ["sac", "d3qn"]:
+        key = f"{a}_lambda{target_lambda:.1f}_seed0"
+        if key in all_results:
+            agents_to_plot.append((a, all_results[key]))
+
+    if len(agents_to_plot) < 2:
+        print("Warning: need both SAC and DDQN results for Fig3 — skipping.")
+        return
+
+    fig, axes = plt.subplots(2, 2, figsize=(10, 6), sharex="col")
+    fig.subplots_adjust(hspace=0.12, wspace=0.28)
+
+    for col_idx, (agent_name, df) in enumerate(agents_to_plot):
+        start = window_start_day * 48
+        end   = start + window_steps
+        if end > len(df):
+            start = max(0, len(df) - window_steps)
+            end = len(df)
+        window = df.iloc[start:end].reset_index(drop=True)
+        t = np.arange(len(window)) / 2.0   # hours
+
+        ax_top = axes[0, col_idx]
+        ax_bot = axes[1, col_idx]
+
+        top_label = "(a)" if col_idx == 0 else "(b)"
+        bot_label = "(c)" if col_idx == 0 else "(d)"
+        ax_top.set_title(top_label, loc="left", fontsize=10, fontweight="bold")
+        ax_bot.set_title(bot_label, loc="left", fontsize=10, fontweight="bold")
+
+        # Top: prices + carbon intensity
+        ax_top.plot(t, window["da_price_now"], color="#2ca02c", linewidth=1.0,
+                    label="DA price")
+        ax_top.plot(t, window["id_price_now"], color="#1f77b4", linewidth=1.0,
+                    linestyle="--", label="ID price")
+        ax_top2 = ax_top.twinx()
+        ax_top2.fill_between(t, window["ci_now"], alpha=0.12, color="#7f7f7f")
+        ax_top2.plot(t, window["ci_now"], color="#7f7f7f", linewidth=0.8,
+                     alpha=0.7, label="CI (gCO₂/kWh)")
+        ax_top2.set_ylabel("CI (gCO₂/kWh)", fontsize=8, color="#555555")
+        ax_top2.tick_params(axis="y", labelcolor="#555555", labelsize=7)
+        ax_top.set_ylabel("Price (£/MWh)", fontsize=8)
+        ax_top.tick_params(labelsize=7)
+        ax_top.grid(alpha=0.2)
+        title_str = agent_name.upper()
+        if agent_name == "sac":
+            title_str += " (Continuous 3D)"
+        else:
+            title_str += " (Discrete 5,808)"
+        ax_top.set_title(title_str, fontsize=9, fontweight="bold")
+        if col_idx == 0:
+            h1, l1 = ax_top.get_legend_handles_labels()
+            h2, l2 = ax_top2.get_legend_handles_labels()
+            ax_top.legend(h1 + h2, l1 + l2, loc="upper left", fontsize=7, framealpha=0.85)
+
+        # Bottom: SoC + dispatched power
+        ax_bot.fill_between(t, window["soc"], alpha=0.35, color="#ff7f0e",
+                            label="SoC")
+        ax_bot.set_ylabel("SoC", fontsize=8)
+        ax_bot.set_ylim(0, 1)
+        ax_bot2 = ax_bot.twinx()
+        ax_bot2.bar(t, window["P_applied_MW"],
+                    width=0.4,
+                    color=["#d62728" if p > 0 else "#1f77b4" for p in window["P_applied_MW"]],
+                    alpha=0.6, label="Dispatch (MW)")
+        ax_bot2.axhline(0, color="black", linewidth=0.5)
+        ax_bot2.set_ylabel("Dispatch (MW)", fontsize=8)
+        ax_bot2.tick_params(labelsize=7)
+        ax_bot.tick_params(labelsize=7)
+        ax_bot.set_xlabel("Hours into 7-day window", fontsize=8)
+        ax_bot.grid(alpha=0.2)
+        if col_idx == 0:
+            ax_bot.legend(loc="upper left", fontsize=7, framealpha=0.85)
+
+    out = os.path.join(FIGURES_MAIN_DIR, "Fig3_Dispatch_Case_Study.pdf")
+    plt.savefig(out, dpi=300, bbox_inches="tight", format="pdf")
+    plt.close()
+    print(f"✓ Fig3_Dispatch_Case_Study.pdf → {FIGURES_MAIN_DIR}/")
+
+
+def plot_fig4_reward_ablation(all_kpis: dict,
+                              agent_names: list,
+                              lambda_values: list) -> None:
+    """
+    Fig4_Reward_Ablation.pdf
+    Pareto frontier: Financial Profit vs Net Carbon across lambda_CI values.
+    Each agent = one coloured line; each point = mean across 5 seeds at one lambda.
+    Error bars show ±1σ. Proves the profit-carbon trade-off is controllable
+    and compares both formulations across the λ ablation.
+    """
+    fig, ax = plt.subplots(figsize=(6, 4))
+
+    # Pareto frontier is SAC-only: the continuous 3D formulation is the paper's
+    # contribution; discrete agents are evaluated at primary lambda only.
+    sac_agents = [n for n in agent_names if n.lower() == "sac"]
+    if not sac_agents:
+        print("  [Fig4] No SAC agent in agent_names — skipping Pareto plot.")
+        return
+
+    for agent_name in sac_agents:
+        profits, carbons = [], []
+        prof_stds, carb_stds = [], []
+        lams_plotted = []
+
+        for lam in sorted(lambda_values):
+            p_seeds = [all_kpis[f"{agent_name}_lambda{lam:.1f}_seed{s}"]["Financial Profit (£)"]
+                       for s in range(5)
+                       if f"{agent_name}_lambda{lam:.1f}_seed{s}" in all_kpis]
+            c_seeds = [all_kpis[f"{agent_name}_lambda{lam:.1f}_seed{s}"]["Net Carbon (tCO2)"]
+                       for s in range(5)
+                       if f"{agent_name}_lambda{lam:.1f}_seed{s}" in all_kpis]
+            if p_seeds:
+                profits.append(np.mean(p_seeds))
+                carbons.append(np.mean(c_seeds))
+                prof_stds.append(np.std(p_seeds))
+                carb_stds.append(np.std(c_seeds))
+                lams_plotted.append(lam)
+
+        if not profits:
+            continue
+
+        color = COLORS.get(agent_name, "#333333")
+        label = "SAC (3D continuous)"
+
+        ax.errorbar(carbons, profits,
+                    xerr=carb_stds, yerr=prof_stds,
+                    label=label, marker="o", linewidth=1.8, markersize=6,
+                    capsize=4, color=color)
+
+        # Annotate every λ point
+        for lam, cx, py in zip(lams_plotted, carbons, profits):
+            ax.annotate(f"λ={lam:.1f}", (cx, py),
+                        textcoords="offset points", xytext=(4, 4),
+                        fontsize=6.5, color="#555555")
+
+    ax.axhline(0, color="red", linestyle="--", linewidth=0.8, alpha=0.5)
+    ax.set_xlabel("Net carbon displacement (tCO₂, 219 days)", fontsize=10)
+    ax.set_ylabel("Financial profit (£, 219 days)", fontsize=10)
+    ax.legend(loc="upper right", fontsize=8, framealpha=0.9)
+    ax.grid(alpha=0.25)
+    plt.tight_layout()
+    out = os.path.join(FIGURES_MAIN_DIR, "Fig4_Reward_Ablation.pdf")
+    plt.savefig(out, dpi=300, bbox_inches="tight", format="pdf")
+    plt.close()
+    print(f"✓ Fig4_Reward_Ablation.pdf → {FIGURES_MAIN_DIR}/")
+
+
+# ============================================================
+# APPENDIX FIGURES (results/figures_appendix/)
+# ============================================================
+
+def plot_appx_soc_duration_curve(all_results: dict,
+                                  agent_names: list,
+                                  target_lambda: float = 0.9) -> None:
+    """Appx_SoC_Duration_Curve.pdf — sorted SoC time-series (duration curve)."""
+    fig, ax = plt.subplots(figsize=(7, 4))
+
+    for agent_name in agent_names:
+        soc_all = []
+        for seed in range(5):
+            key = f"{agent_name}_lambda{target_lambda:.1f}_seed{seed}"
+            if key in all_results:
+                soc_all.extend(all_results[key]["soc"].tolist())
+        if not soc_all:
+            continue
+        sorted_soc = np.sort(soc_all)[::-1]
+        pct = np.linspace(0, 100, len(sorted_soc))
+        ax.plot(pct, sorted_soc, color=COLORS.get(agent_name, "#333333"),
+                linewidth=1.5, label=agent_name.upper())
+
+    ax.set_xlabel("% of time above SoC level", fontsize=10)
+    ax.set_ylabel("State of Charge (SoC)", fontsize=10)
+    ax.set_ylim(0, 1)
+    ax.legend(fontsize=8, framealpha=0.9)
+    ax.grid(alpha=0.25)
+    plt.tight_layout()
+    out = os.path.join(FIGURES_APPENDIX_DIR, "Appx_SoC_Duration_Curve.pdf")
+    plt.savefig(out, dpi=300, bbox_inches="tight", format="pdf")
+    plt.close()
+    print(f"✓ Appx_SoC_Duration_Curve.pdf → {FIGURES_APPENDIX_DIR}/")
+
+
+def plot_appx_da_fidelity_hexbin(all_results: dict,
+                                  agent_names: list,
+                                  target_lambda: float = 0.9) -> None:
+    """Appx_DA_Fidelity_Hexbin.pdf — planned vs actual power (hexbin density).
+
+    Layout: 2×2 grid — top row: SAC, D3QN; bottom row: DDQN, DQN.
+    """
+    layout = [["sac", "d3qn"], ["ddqn", "dqn"]]
+    fig, axes = plt.subplots(2, 2, figsize=(8, 8), squeeze=False)
+
+    for row, row_agents in enumerate(layout):
+        for col, agent_name in enumerate(row_agents):
+            ax = axes[row, col]
+
+            label_letter = chr(ord('a')+ row * 2 + col)
+            ax.set_title(f"({label_letter})", loc="left", fontsize=10, fontweight="bold")
+        
+            if agent_name not in agent_names:
+                ax.set_visible(False)
+                continue
+            planned_all, actual_all = [], []
+            for seed in range(5):
+                key = f"{agent_name}_lambda{target_lambda:.1f}_seed{seed}"
+                if key in all_results:
+                    df = all_results[key]
+                    planned_all.extend(df["P_planned_MW"].tolist())
+                    actual_all.extend(df["P_applied_MW"].tolist())
+            if not planned_all:
+                ax.set_visible(False)
+                continue
+            hb = ax.hexbin(planned_all, actual_all, gridsize=40, cmap="Blues",
+                           mincnt=1, linewidths=0.2)
+            ax.plot([-60, 60], [-60, 60], "r--", linewidth=1.0, alpha=0.7, label="Perfect fidelity")
+            ax.set_xlabel("Planned power (MW)", fontsize=9)
+            ax.set_ylabel("Actual power (MW)", fontsize=9)
+            ax.set_title(agent_name.upper(), fontsize=9, fontweight="bold")
+            ax.legend(fontsize=7)
+            fig.colorbar(hb, ax=ax, label="count")
+
+    plt.tight_layout()
+    out = os.path.join(FIGURES_APPENDIX_DIR, "Appx_DA_Fidelity_Hexbin.pdf")
+    plt.savefig(out, dpi=300, bbox_inches="tight", format="pdf")
+    plt.close()
+    print(f"✓ Appx_DA_Fidelity_Hexbin.pdf → {FIGURES_APPENDIX_DIR}/")
+
+
+def plot_appx_dispatch_price_heatmap(all_results: dict,
+                                      agent_names: list,
+                                      target_lambda: float = 0.9) -> None:
+    """Appx_Dispatch_Price_Heatmap.pdf — mean dispatch by settlement period and day-of-week.
+
+    Layout: 2×2 grid — top row: SAC, D3QN; bottom row: DDQN, DQN.
+    """
+    layout = [["sac", "d3qn"], ["ddqn", "dqn"]]
+    day_order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+    fig, axes = plt.subplots(2, 2, figsize=(10, 10), squeeze=False)
+
+    for row, row_agents in enumerate(layout):
+        for col, agent_name in enumerate(row_agents):
+            ax = axes[row, col]
+            
+            label_letter = chr(ord('a') + row * 2 + col)
+            ax.set_title(f"({label_letter})", loc="left", fontsize=10, fontweight="bold")
+
+            if agent_name not in agent_names:
+                ax.set_visible(False)
+                continue
+            dfs = []
+            for seed in range(5):
+                key = f"{agent_name}_lambda{target_lambda:.1f}_seed{seed}"
+                if key in all_results:
+                    dfs.append(all_results[key])
+            if not dfs:
+                ax.set_visible(False)
+                continue
+            df = pd.concat(dfs, ignore_index=True)
+            df["day_of_week"] = pd.to_datetime(df["delivery_ts"]).dt.day_name()
+            pivot = df.pivot_table(values="P_applied_MW", index="tau",
+                                   columns="day_of_week", aggfunc="mean")
+            for d in day_order:
+                if d not in pivot.columns:
+                    pivot[d] = np.nan
+            pivot = pivot[[d for d in day_order if d in pivot.columns]]
+            sns.heatmap(pivot, cmap="RdBu_r", center=0, ax=ax,
+                        cbar_kws={"label": "Mean dispatch (MW)", "shrink": 0.7},
+                        linewidths=0)
+            ax.set_xlabel("Day of week", fontsize=9)
+            ax.set_ylabel("Settlement period (1–48)", fontsize=9)
+            ax.set_title(agent_name.upper(), fontsize=9, fontweight="bold")
+            ax.tick_params(labelsize=7)
+
+    plt.tight_layout()
+    out = os.path.join(FIGURES_APPENDIX_DIR, "Appx_Dispatch_Price_Heatmap.pdf")
+    plt.savefig(out, dpi=300, bbox_inches="tight", format="pdf")
+    plt.close()
+    print(f"✓ Appx_Dispatch_Price_Heatmap.pdf → {FIGURES_APPENDIX_DIR}/")
+
+
+def plot_appx_action_distribution(all_results: dict,
+                                   agent_names: list,
+                                   target_lambda: float = 0.9) -> None:
+    """Appx_Action_Distribution.pdf — Charge / Idle / Discharge fractions per agent."""
+    labels, charge_pct, idle_pct, discharge_pct = [], [], [], []
+
+    for agent_name in agent_names:
+        all_dfs = []
+        for seed in range(5):
+            key = f"{agent_name}_lambda{target_lambda:.1f}_seed{seed}"
+            if key in all_results:
+                all_dfs.append(all_results[key])
+        if not all_dfs:
+            continue
+        df = pd.concat(all_dfs, ignore_index=True)
+        n = len(df)
+        labels.append(agent_name.upper())
+        charge_pct.append((df["P_applied_MW"] < -1e-4).sum() / n * 100)
+        idle_pct.append((df["P_applied_MW"].abs() < 1e-4).sum() / n * 100)
+        discharge_pct.append((df["P_applied_MW"] > 1e-4).sum() / n * 100)
+
+    if not labels:
+        print("Warning: No data for Appx_Action_Distribution — skipping.")
+        return
+
+    x = np.arange(len(labels))
+    width = 0.5
+    fig, ax = plt.subplots(figsize=(5, 4))
+
+    ax.bar(x, charge_pct, width, label="Charge", color="#1f77b4", alpha=0.85)
+    ax.bar(x, idle_pct, width, bottom=charge_pct, label="Idle", color="#9467bd", alpha=0.85)
+    bottom2 = [c + i for c, i in zip(charge_pct, idle_pct)]
+    ax.bar(x, discharge_pct, width, bottom=bottom2, label="Discharge",
+           color="#d62728", alpha=0.85)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, fontsize=9)
+    ax.set_ylabel("Fraction of steps (%)", fontsize=10)
+    ax.set_ylim(0, 105)
+    ax.legend(fontsize=9, framealpha=0.9)
+    ax.grid(axis="y", alpha=0.25)
+    plt.tight_layout()
+    out = os.path.join(FIGURES_APPENDIX_DIR, "Appx_Action_Distribution.pdf")
+    plt.savefig(out, dpi=300, bbox_inches="tight", format="pdf")
+    plt.close()
+    print(f"✓ Appx_Action_Distribution.pdf → {FIGURES_APPENDIX_DIR}/")
+
+
+# ============================================================
 # MAIN EXECUTION
 # ============================================================
 
@@ -2259,16 +3073,24 @@ if __name__ == "__main__":
                        help="Agent(s) to evaluate (use --agents sac for SAC)")
     parser.add_argument("--seeds", nargs="+", type=int, default=[0, 1, 2, 3, 4],
                        help="Seeds to evaluate per agent")
-    parser.add_argument("--lambda-values", nargs="+", type=float, default=[0.0, 0.1, 0.3, 0.5, 1.0],
+    parser.add_argument("--lambda-values", nargs="+", type=float, default=[0.0, 0.1, 0.3, 0.6, 1.0],
                        help="Lambda_ci values for Pareto ablation")
-    parser.add_argument("--baselines", action="store_true", default=False,
-                       help="Also run Idle, Random, and P20/P80 baselines")
+    parser.add_argument("--no-baselines", action="store_true", default=False,
+                       help="Skip Idle, Random, and P20/P80 baselines")
     parser.add_argument("--run-lp", action="store_true", default=False,
                        help="Solve the perfect-foresight LP benchmark for each lambda_ci "
                             "and add LP Efficiency Ratio (%) to the comparison table")
     parser.add_argument("--generate-figures", action="store_true", default=False,
                        help="Generate publication-grade visualizations")
+    parser.add_argument("--primary-lambda", type=float, default=0.1,
+                       help="Primary lambda_ci for main figures (should match training lambda). "
+                            "Default: 0.1 (matches training configuration). "
+                            "Must be present in --lambda-values if --generate-figures is used.")
     args = parser.parse_args()
+
+    # Ensure primary_lambda is included in lambda_values if generating figures
+    if args.generate_figures and args.primary_lambda not in args.lambda_values:
+        args.lambda_values = sorted(set(args.lambda_values) | {args.primary_lambda})
 
     all_results = {}
     all_kpis    = {}
@@ -2288,13 +3110,13 @@ if __name__ == "__main__":
                       f"DegCost: £{res['deg_cost_gbp']:,.0f}  "
                       f"CarbonCost: £{res['carbon_cost_gbp']:,.0f}")
 
-    if args.baselines:
+    if not args.no_baselines:
         print("\n" + "="*50)
         print(" RUNNING BASELINES")
         print("="*50)
 
-        # Use the same lambda_ci as agents for fair comparison
-        baseline_lambda = args.lambda_values[0] if args.lambda_values else 0.1
+        # Use primary_lambda for baselines so they are comparable to the main RL results
+        baseline_lambda = args.primary_lambda
         env = build_test_env(lambda_ci=baseline_lambda)
 
         print(" -> Running Idle Baseline...")
@@ -2323,7 +3145,7 @@ if __name__ == "__main__":
                 print(f"\n -> Evaluating {label}...")
                 try:
                     if agent_name == "sac":
-                        agent = load_frozen_sac_agent(seed)
+                        agent = load_frozen_sac_agent(seed, lambda_ci=lambda_ci)
                         env = build_test_env(lambda_ci=lambda_ci, continuous_action=True)
                         df = run_continuous_rollout_sac(agent, env)
                     else:
@@ -2357,36 +3179,53 @@ if __name__ == "__main__":
 
     # Generate publication figures
     if args.generate_figures:
+        target_lam = args.primary_lambda
+
         print("\n" + "="*80)
-        print(" GENERATING IEEE PUBLICATION FIGURES (CONSOLIDATED THEME-BASED)")
+        print(" GENERATING IEEE PUBLICATION FIGURES")
+        print(f" Target λ = {target_lam}  |  Main → {FIGURES_MAIN_DIR}  |  Appendix → {FIGURES_APPENDIX_DIR}")
         print("="*80)
 
-        # --- HERO FIGURE: Chronological Dispatch ---
-        if args.agents:
-            print("\n[HERO] Generating Hero Figure (Contextual Dispatch)...")
-            plot_chronological_dispatch(all_results, args.agents[0], lambda_ci=0.1, seed=0)
+        # ── MAIN FIGURES ──────────────────────────────────────────────────────
+        print("\n[MAIN] Table 1: KPI Summary CSV ...")
+        save_kpi_table(all_results, all_kpis, lp_objectives, args.agents, target_lam)
 
-        # --- THEME A: Financial Performance (1 large consolidated figure) ---
-        print("\n[THEME A] Financial Performance (Consolidated into 1 figure)...")
-        plot_theme_a_financial(all_results, all_kpis, args.agents, args.lambda_values, target_lambda=0.1)
+        print("\n[MAIN] Fig 1: Cumulative Profit (LP Oracle + ±1σ bands)...")
+        plot_fig1_cumulative_profit(all_results, args.agents, lp_objectives, target_lam)
 
-        # --- THEME B: Battery Operations (1 large consolidated figure) ---
-        print("\n[THEME B] Battery Operations (Consolidated into 1 figure)...")
-        plot_theme_b_operations(all_results, args.agents, args.lambda_values, target_lambda=0.1)
+        print("\n[MAIN] Fig 2: Revenue Decomposition (DA/ID/Deg/Carbon + LP) ...")
+        plot_fig2_revenue_decomposition(all_results, all_kpis, lp_objectives, args.agents, target_lam)
 
-        # --- THEME C: Market Timing & Policy Intelligence (1 large consolidated figure) ---
-        print("\n[THEME C] Policy Intelligence (Consolidated into 1 figure)...")
-        plot_theme_c_policy(all_results, args.agents, target_lambda=0.1)
+        print("\n[MAIN] Fig 3: Dispatch Case Study (7-day SAC vs DDQN) ...")
+        plot_fig3_dispatch_case_study(all_results, target_lambda=target_lam)
 
-        # --- THEME D: Regime Adaptation & Carbon Intensity (1 consolidated figure) ---
-        print("\n[THEME D] Regime Adaptation & Carbon Intensity (Consolidated into 1 figure)...")
-        plot_theme_d_regime(all_results, all_kpis, args.agents, args.lambda_values, target_lambda=0.1)
+        print("\n[MAIN] Fig 4: Reward Ablation (Pareto frontier) ...")
+        plot_fig4_reward_ablation(all_kpis, args.agents, args.lambda_values)
+
+        # ── APPENDIX FIGURES ──────────────────────────────────────────────────
+        print("\n[APPENDIX] SoC Duration Curve ...")
+        plot_appx_soc_duration_curve(all_results, args.agents, target_lam)
+
+        print("\n[APPENDIX] DA Fidelity Hexbin ...")
+        plot_appx_da_fidelity_hexbin(all_results, args.agents, target_lam)
+
+        print("\n[APPENDIX] Dispatch Price Heatmap ...")
+        plot_appx_dispatch_price_heatmap(all_results, args.agents, target_lam)
+
+        print("\n[APPENDIX] Action Distribution ...")
+        plot_appx_action_distribution(all_results, args.agents, target_lam)
 
         print(f"\n{'='*80}")
-        print(f"[SUCCESS] 5 consolidated figures saved to: {FIGURES_DIR}/")
-        print(f"  • 01_HERO: Chronological Dispatch (7-day case study)")
-        print(f"  • THEME_A_Financial_Performance (2×3 grid, 5 subplots)")
-        print(f"  • THEME_B_Battery_Operations (2×2 grid, 4 subplots)")
-        print(f"  • THEME_C_Policy_Intelligence (2×3 grid, 5 subplots)")
-        print(f"  • THEME_D_Regime_Adaptation (1×2 grid, 2 subplots)")
+        print("[SUCCESS] Publication figures generated:")
+        print(f"  MAIN  ({FIGURES_MAIN_DIR}/):")
+        print("    Table_1_KPI_Summary.csv")
+        print("    Fig1_Cumulative_Profit.pdf  (LP Oracle ceiling + ±1σ)")
+        print("    Fig2_Revenue_Decomposition.pdf  (DA / ID / Deg / Carbon + LP)")
+        print("    Fig3_Dispatch_Case_Study.pdf  (7-day SAC vs DDQN)")
+        print("    Fig4_Reward_Ablation.pdf  (Pareto frontier)")
+        print(f"  APPENDIX  ({FIGURES_APPENDIX_DIR}/):")
+        print("    Appx_SoC_Duration_Curve.pdf")
+        print("    Appx_DA_Fidelity_Hexbin.pdf")
+        print("    Appx_Dispatch_Price_Heatmap.pdf")
+        print("    Appx_Action_Distribution.pdf")
         print(f"{'='*80}")

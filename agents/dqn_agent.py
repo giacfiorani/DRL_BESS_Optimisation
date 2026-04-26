@@ -5,82 +5,127 @@ from agents.replay_buffer import ReplayBuffer
 import copy
 
 
-class DQNAgent():
+class DQNAgent:
+    """Deep Q-Network agent with a separate target network.
 
-    def __init__(self, gamma, epsilon, lr, input_dims, batch_size, n_actions,
-                        max_mem_size = 100000, eps_min =0.01, eps_dec=1e-5, replace_target_cnt = 5000):
-        self.gamma = gamma
-        self.epsilon = epsilon
-        self.lr = lr
-        self.n_actions = n_actions
+    Implements the standard DQN algorithm (Mnih et al., 2015) with periodic
+    hard target-network updates and gradient clipping.
+    """
+
+    def __init__(
+        self,
+        gamma,
+        epsilon,
+        lr,
+        input_dims,
+        batch_size,
+        n_actions,
+        max_mem_size=100000,
+        eps_min=0.01,
+        eps_dec=1e-5,
+        replace_target_cnt=5000,
+    ):
+        """Initialise the DQN agent.
+
+        Args:
+            gamma: Discount factor.
+            epsilon: Initial exploration probability.
+            lr: Learning rate for the Adam optimiser.
+            input_dims: Dimensionality of the observation vector.
+            batch_size: Number of transitions sampled per learning step.
+            n_actions: Number of discrete actions.
+            max_mem_size: Maximum replay buffer capacity.
+            eps_min: Minimum exploration probability.
+            eps_dec: Linear epsilon decrement per learning step.
+            replace_target_cnt: Number of learning steps between hard target
+                network updates.
+        """
+        self.gamma    = gamma
+        self.epsilon  = epsilon
+        self.lr       = lr
+        self.n_actions  = n_actions
         self.input_dims = input_dims
         self.batch_size = batch_size
-        self.eps_dec = eps_dec
-        self.eps_min = eps_min
+        self.eps_dec    = eps_dec
+        self.eps_min    = eps_min
 
-        self.Q_eval = DeepQNetwork(self.lr, n_actions=self.n_actions, input_dims=self.input_dims, fc1_dims=256, fc2_dims=256)
+        self.Q_eval   = DeepQNetwork(self.lr, n_actions=self.n_actions,
+                                     input_dims=self.input_dims, fc1_dims=256, fc2_dims=256)
         self.Q_target = copy.deepcopy(self.Q_eval)
-        self.learn_step_counter = 0
-        self.target_update_frequency = replace_target_cnt #update target every 5000 steps.
+        self.learn_step_counter      = 0
+        self.target_update_frequency = replace_target_cnt
 
         self.memory = ReplayBuffer(max_size=max_mem_size, obs_dim=input_dims)
 
     def store_transition(self, state, action, reward, next_state, done):
+        """Add a transition to the replay buffer.
+
+        Args:
+            state: Current observation.
+            action: Action taken.
+            reward: Scalar reward received.
+            next_state: Subsequent observation.
+            done: Episode termination flag.
+        """
         self.memory.add_experience(state, action, reward, next_state, done)
 
     def choose_action(self, observation):
+        """Select an action using an ε-greedy policy.
+
+        Args:
+            observation: Current environment observation.
+
+        Returns:
+            Integer action index.
+        """
         if np.random.random() < self.epsilon:
-            # EXPLORE: Pick any of the 5,808 actions at random
-            action = np.random.randint(self.n_actions)
-        else:
-            # EXPLOIT: Use the brain
-            with T.no_grad():
-                # Zero-copy: from_numpy shares memory when obs is already float32 C-contiguous
-                state = T.from_numpy(np.asarray(observation, dtype=np.float32)).to(self.Q_eval.device).unsqueeze(0)
-                q_values = self.Q_eval.forward(state)
-                action = T.argmax(q_values, dim=1).item()
-        return action
+            return np.random.randint(self.n_actions)
+
+        with T.no_grad():
+            # Zero-copy: as_tensor shares memory when the array is float32 C-contiguous.
+            state    = T.from_numpy(np.asarray(observation, dtype=np.float32)).to(self.Q_eval.device).unsqueeze(0)
+            q_values = self.Q_eval.forward(state)
+            return T.argmax(q_values, dim=1).item()
 
     def learn(self):
-        # 1. Only start learning if we have enough memory
+        """Sample a minibatch and perform one gradient update.
+
+        Returns:
+            Tuple of (loss, grad_norm, q_mean), or (None, None, None) if the
+            replay buffer contains fewer transitions than ``batch_size``.
+        """
         if len(self.memory) < self.batch_size:
             return None, None, None
-        
-        # 2. Reset the otpimiser gradients to zero - should we?
+
         self.Q_eval.optimiser.zero_grad()
 
-        # 3. Sample a batch from ReplayBuffer
-        states, actions, rewards, states_, dones =  self.memory.sample_batch(self.batch_size)
-        
-        # as_tensor is zero-copy when the numpy array dtype already matches (float32/int64/bool)
-        # and the array is C-contiguous (guaranteed by the ring buffer's fancy-index slices)
+        states, actions, rewards, states_, dones = self.memory.sample_batch(self.batch_size)
+
+        # as_tensor is zero-copy when the array dtype matches and is C-contiguous.
         device  = self.Q_eval.device
         states  = T.as_tensor(states,  dtype=T.float32).to(device)
         actions = T.as_tensor(actions, dtype=T.int64).to(device)
         rewards = T.as_tensor(rewards, dtype=T.float32).to(device)
         states_ = T.as_tensor(states_, dtype=T.float32).to(device)
         dones   = T.as_tensor(dones,   dtype=T.bool).to(device)
-        
-        # Predicted Q-values for the actions we actually took
+
         q_eval = self.Q_eval.forward(states)
-        q_pred = q_eval.gather(1, actions.unsqueeze(1)).squeeze(1)
-        
-        # Target Q-values (The Bellman Equation)
-        q_next = self.Q_target.forward(states_).detach()
+        q_pred = q_eval.gather(1, actions.unsqueeze(1)).squeeze(1)  # [B]
+
+        q_next     = self.Q_target.forward(states_).detach()
         max_q_next = T.max(q_next, dim=1)[0]
 
-        # Mask the target if the episode is done
         expected_q_values = rewards + self.gamma * max_q_next * (~dones).float()
 
-        assert q_pred.shape == expected_q_values.shape, \
-            f"Shape mismatch before loss: q_pred={q_pred.shape}, expected={expected_q_values.shape}"
-        #compute Loss Function
-        loss = self.Q_eval.loss(q_pred, expected_q_values)
+        assert q_pred.shape == expected_q_values.shape, (
+            f"Shape mismatch before loss: q_pred={q_pred.shape}, "
+            f"expected={expected_q_values.shape}"
+        )
 
-        # optimise the model
+        loss = self.Q_eval.loss(q_pred, expected_q_values)
         loss.backward()
 
-        # Capture pre-clip grad norm (tells you when gradients were exploding)
+        # Compute pre-clip gradient norm for monitoring.
         total_norm = 0.0
         for p in self.Q_eval.parameters():
             if p.grad is not None:
@@ -90,17 +135,14 @@ class DQNAgent():
         T.nn.utils.clip_grad_norm_(self.Q_eval.parameters(), max_norm=10.0)
         self.Q_eval.optimiser.step()
 
-        # Mean max Q-valuye over the batch (proxy for value estimate health)
         with T.no_grad():
             q_mean = q_eval.max(dim=1)[0].mean().item()
 
-        # Epsilon decay logic
         if self.epsilon > self.eps_min:
             self.epsilon -= self.eps_dec
         else:
             self.epsilon = self.eps_min
 
-        # Target network update
         self.learn_step_counter += 1
         if self.learn_step_counter % self.target_update_frequency == 0:
             self.Q_target.load_state_dict(self.Q_eval.state_dict())
