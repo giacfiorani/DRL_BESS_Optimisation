@@ -26,6 +26,8 @@ import torch as T
 import matplotlib.pyplot as plt
 import seaborn as sns
 from matplotlib.gridspec import GridSpec
+from matplotlib.colors import LogNorm
+import matplotlib
 
 # --- Project imports ---
 from benchmarks.lp_benchmark import solve_lp_benchmark
@@ -35,13 +37,11 @@ from envs.reward_scaling import get_frozen_scales
 from agents.dqn_agent import DQNAgent
 from agents.ddqn_agent import DDQNAgent
 from agents.d3qn import D3QNAgent
-from agents.d3qn_per_agent import D3QNPERAgent
 from agents.sac_agent import SACAgent
 from agents.hyperparams import (
     DQN_HYPERPARAMS,
     DDQN_HYPERPARAMS,
     D3QN_HYPERPARAMS,
-    D3QN_PER_HYPERPARAMS,
     SAC_HYPERPARAMS,
 )
 from utils.action_encoding import decode, N_ACTIONS
@@ -98,7 +98,6 @@ AGENTS: dict[str, type] = {
     "dqn":      DQNAgent,
     "ddqn":     DDQNAgent,
     "d3qn":     D3QNAgent,
-    "d3qn_per": D3QNPERAgent,
     "sac":      SACAgent,
 }
 
@@ -106,7 +105,6 @@ HYPERPARAMS_MAP: dict[str, dict] = {
     "dqn":      DQN_HYPERPARAMS,
     "ddqn":     DDQN_HYPERPARAMS,
     "d3qn":     D3QN_HYPERPARAMS,
-    "d3qn_per": D3QN_PER_HYPERPARAMS,
     "sac":      SAC_HYPERPARAMS,
 }
 
@@ -2823,7 +2821,7 @@ def plot_fig4_reward_ablation(all_kpis: dict,
     Error bars show ±1σ. Proves the profit-carbon trade-off is controllable
     and compares both formulations across the λ ablation.
     """
-    fig, ax = plt.subplots(figsize=(6, 4))
+    fig, ax = plt.subplots(figsize=(6, 3))
 
     # Pareto frontier is SAC-only: the continuous 3D formulation is the paper's
     # contribution; discrete agents are evaluated at primary lambda only.
@@ -2868,6 +2866,7 @@ def plot_fig4_reward_ablation(all_kpis: dict,
                         textcoords="offset points", xytext=(4, 4),
                         fontsize=6.5, color="#555555")
 
+    ax.set_ylim(bottom=100000)
     ax.axhline(0, color="red", linestyle="--", linewidth=0.8, alpha=0.5)
     ax.set_xlabel("Net carbon displacement (tCO₂, 219 days)", fontsize=10)
     ax.set_ylabel("Financial profit (£, 219 days)", fontsize=10)
@@ -2921,20 +2920,36 @@ def plot_appx_da_fidelity_hexbin(all_results: dict,
     """Appx_DA_Fidelity_Hexbin.pdf — planned vs actual power (hexbin density).
 
     Layout: 2×2 grid — top row: SAC, D3QN; bottom row: DDQN, DQN.
+    Log-normalised density scale (viridis) prevents origin saturation.
     """
+
+    matplotlib.rcParams.update({
+        "font.family": "serif",
+        "font.serif": ["Times New Roman", "DejaVu Serif"],
+        "mathtext.fontset": "stix",
+        "axes.spines.top": False,
+        "axes.spines.right": False,
+        "xtick.direction": "in",
+        "ytick.direction": "in",
+        "xtick.major.size": 2.5,
+        "ytick.major.size": 2.5,
+        "axes.linewidth": 0.6,
+    })
+
     layout = [["sac", "d3qn"], ["ddqn", "dqn"]]
-    fig, axes = plt.subplots(2, 2, figsize=(8, 8), squeeze=False)
+    fig, axes = plt.subplots(2, 2, figsize=(7, 7), squeeze=False)
+
+    _L, _K, _G = 9, 8, 7.5
+    p_lim = 55  # MW axis limit (slightly beyond 49.95 MW rated power)
 
     for row, row_agents in enumerate(layout):
         for col, agent_name in enumerate(row_agents):
             ax = axes[row, col]
 
-            label_letter = chr(ord('a')+ row * 2 + col)
-            ax.set_title(f"({label_letter})", loc="left", fontsize=10, fontweight="bold")
-        
             if agent_name not in agent_names:
                 ax.set_visible(False)
                 continue
+
             planned_all, actual_all = [], []
             for seed in range(5):
                 key = f"{agent_name}_lambda{target_lambda:.1f}_seed{seed}"
@@ -2945,16 +2960,41 @@ def plot_appx_da_fidelity_hexbin(all_results: dict,
             if not planned_all:
                 ax.set_visible(False)
                 continue
-            hb = ax.hexbin(planned_all, actual_all, gridsize=40, cmap="Blues",
-                           mincnt=1, linewidths=0.2)
-            ax.plot([-60, 60], [-60, 60], "r--", linewidth=1.0, alpha=0.7, label="Perfect fidelity")
-            ax.set_xlabel("Planned power (MW)", fontsize=9)
-            ax.set_ylabel("Actual power (MW)", fontsize=9)
-            ax.set_title(agent_name.upper(), fontsize=9, fontweight="bold")
-            ax.legend(fontsize=7)
-            fig.colorbar(hb, ax=ax, label="count")
 
-    plt.tight_layout()
+            hb = ax.hexbin(planned_all, actual_all, gridsize=40,
+                           cmap="viridis", norm=LogNorm(), mincnt=1,
+                           linewidths=0.1)
+
+            ax.plot([-p_lim, p_lim], [-p_lim, p_lim], "r--",
+                    linewidth=0.9, zorder=5, label="Perfect fidelity")
+            ax.axhline(0, color="0.7", linewidth=0.4, zorder=1)
+            ax.axvline(0, color="0.7", linewidth=0.4, zorder=1)
+
+            ax.set_xlim(-p_lim, p_lim)
+            ax.set_ylim(-p_lim, p_lim)
+            ax.set_xlabel("$P^{\\mathrm{DA}}$ planned (MW)", fontsize=_L)
+            ax.set_ylabel("$P$ applied (MW)", fontsize=_L)
+            ax.tick_params(labelsize=_K)
+
+            label_letter = chr(ord('a') + row * 2 + col)
+            ax.text(0.04, 0.96,
+                    f"({label_letter}) {agent_name.upper()}",
+                    transform=ax.transAxes, fontsize=_L,
+                    fontweight="bold", va="top", ha="left",
+                    bbox=dict(boxstyle="round,pad=0.15",
+                              facecolor="white", edgecolor="0.7",
+                              linewidth=0.5, alpha=0.9))
+            ax.legend(fontsize=_G, frameon=True, framealpha=0.85,
+                      edgecolor="0.8", loc="lower right",
+                      handlelength=1.4)
+
+            cb = fig.colorbar(hb, ax=ax)
+            cb.set_label("Settlement-period count (log scale)", fontsize=_G)
+            cb.ax.tick_params(labelsize=_G - 0.5)
+            cb.outline.set_linewidth(0.5)
+
+    fig.subplots_adjust(left=0.10, right=0.94, top=0.96, bottom=0.10,
+                        hspace=0.38, wspace=0.42)
     out = os.path.join(FIGURES_APPENDIX_DIR, "Appx_DA_Fidelity_Hexbin.pdf")
     plt.savefig(out, dpi=300, bbox_inches="tight", format="pdf")
     plt.close()
